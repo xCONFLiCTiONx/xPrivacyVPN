@@ -1,0 +1,548 @@
+package com.xconflictionx.xprivacyvpn.vpn
+
+import android.content.Context
+import android.net.VpnService
+import com.xconflictionx.xprivacyvpn.config.WireGuardConfig
+import com.xconflictionx.xprivacyvpn.dns.ZeroTrustDnsConfig
+import com.xconflictionx.xprivacyvpn.dns.ZeroTrustDnsResolver
+import com.xconflictionx.xprivacyvpn.filter.FilterEngine
+import com.xconflictionx.xprivacyvpn.filter.FilterSource
+import com.xconflictionx.xprivacyvpn.filter.FilterSourceRepository
+import com.xconflictionx.xprivacyvpn.filter.FilterStats
+import com.xconflictionx.xprivacyvpn.firewall.FirewallManager
+import com.xconflictionx.xprivacyvpn.firewall.InstalledAppInfo
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+
+enum class TunnelStatus {
+    DISCONNECTED,
+    CONNECTING,
+    CONNECTED,
+    ERROR
+}
+
+data class TrafficLogEntry(
+    val id: String,
+    val timestampMs: Long = System.currentTimeMillis(),
+    val target: String,
+    val protocol: String,
+    val blocked: Boolean,
+    val matchedRule: String? = null,
+    val sourceName: String? = null
+)
+
+data class VpnRuntimeState(
+    val status: TunnelStatus = TunnelStatus.DISCONNECTED,
+    val statusMessage: String = "Disconnected",
+    val handshakeEstablished: Boolean = false,
+    val lastHandshakeMs: Long = 0L,
+    val endpoint: String = "Not Configured",
+    val tunnelAddresses: String = "Import a .conf file in WG Conf tab",
+    val tunnelDns: String = "System DNS (Default)",
+    val zeroTrustDns: ZeroTrustDnsConfig = ZeroTrustDnsConfig(),
+    val rxBytes: Long = 0L,
+    val txBytes: Long = 0L,
+    val blockedCount: Long = 0L,
+    val allowedCount: Long = 0L,
+    val dnsFilteringEnabled: Boolean = true,
+    val deepInspectionEnabled: Boolean = true,
+    val useNxDomain: Boolean = false,
+    val autoStartOnBoot: Boolean = true,
+    val bypassedPackages: Set<String> = emptySet(),
+    val effectiveBypassedPackages: Set<String> = emptySet(),
+    val filterStats: FilterStats = FilterStats(0, 0, 0, 0, 0),
+    val isScreenOn: Boolean = true,
+    val dynamicKeepaliveSec: Int = 0,
+    val recentLogs: List<TrafficLogEntry> = emptyList()
+)
+
+object VpnStateManager {
+    private const val PREFS_NAME = "xprivacy_wg_prefs_v2"
+    private const val KEY_WG_CONF = "wg_conf_text"
+    private const val KEY_DNS_FILTER = "dns_filter_enabled"
+    private const val KEY_DEEP_INSPECT = "deep_inspect_enabled"
+    private const val KEY_USE_NXDOMAIN = "use_nxdomain"
+    private const val KEY_AUTO_START_BOOT = "auto_start_on_boot"
+    private const val KEY_BYPASSED_PACKAGES = "firewall_tunneled_packages_v1"
+
+    private const val KEY_ZT_IPV4_PRIMARY = "zt_dns_ipv4_primary"
+    private const val KEY_ZT_IPV4_SECONDARY = "zt_dns_ipv4_secondary"
+    private const val KEY_ZT_SOURCE_IPV4 = "zt_dns_source_ipv4"
+    private const val KEY_ZT_IPV6 = "zt_dns_ipv6"
+    private const val KEY_ZT_SOURCE_IPV6 = "zt_dns_source_ipv6"
+    private const val KEY_ZT_DOT = "zt_dns_dot"
+    private const val KEY_ZT_DOH = "zt_dns_doh"
+    private const val KEY_PRIVATE_DNS_DOMAIN = "private_dns_domain"
+    private const val KEY_PRIVATE_DNS_SERVER = "private_dns_server"
+
+    private const val MAX_LOG_ENTRIES = 120
+    private const val TELEMETRY_FLUSH_INTERVAL_MS = 1500L
+
+    val filterEngine = FilterEngine()
+
+    @Volatile
+    var activeVpnService: VpnService? = null
+
+    @Volatile
+    private var initialized = false
+
+    @Volatile
+    private var storageMigrated = false
+
+    @Volatile
+    private var uiVisible = false
+
+    val isUiVisible: Boolean
+        get() = uiVisible
+
+    /**
+     * Returns a Device-Protected Storage Context so Always-On VPN and BootCompletedReceiver
+     * can read WireGuard configs, Zero Trust DNS settings, and filter lists immediately on reboot
+     * (even during Direct Boot before screen unlock), while automatically migrating any existing
+     * credential-encrypted settings once unlocked.
+     */
+    fun deviceProtectedContext(context: Context): Context {
+        val appCtx = context.applicationContext ?: context
+        val dpCtx = appCtx.createDeviceProtectedStorageContext()
+        if (!storageMigrated) {
+            runCatching {
+                val um = appCtx.getSystemService(android.os.UserManager::class.java)
+                if (um == null || um.isUserUnlocked) {
+                    val dpPrefs = dpCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    if (!dpPrefs.contains(KEY_WG_CONF)) {
+                        dpCtx.moveSharedPreferencesFrom(appCtx, PREFS_NAME)
+                    }
+                    val dpFilterPrefs = dpCtx.getSharedPreferences("xprivacy_filters_prefs", Context.MODE_PRIVATE)
+                    if (!dpFilterPrefs.contains("filter_sources_v2")) {
+                        dpCtx.moveSharedPreferencesFrom(appCtx, "xprivacy_filters_prefs")
+                    }
+                    val oldFiltersDir = java.io.File(appCtx.filesDir, "filters")
+                    val newFiltersDir = java.io.File(dpCtx.filesDir, "filters")
+                    if (oldFiltersDir.exists()) {
+                        newFiltersDir.mkdirs()
+                        oldFiltersDir.listFiles()?.forEach { file ->
+                            val target = java.io.File(newFiltersDir, file.name)
+                            if (!target.exists()) {
+                                file.copyTo(target, overwrite = true)
+                            }
+                        }
+                    }
+                    storageMigrated = true
+                }
+            }
+        }
+        return dpCtx
+    }
+
+    // Lock-free atomic counters to prevent per-packet StateFlow / Compose recomposition storms
+    private val rxBytesCounter = AtomicLong(0L)
+    private val txBytesCounter = AtomicLong(0L)
+    private val blockedCounter = AtomicLong(0L)
+    private val allowedCounter = AtomicLong(0L)
+    private val logIdSequence = AtomicLong(0L)
+    private val lastTelemetryPublishMs = AtomicLong(0L)
+    private val logsDirty = AtomicBoolean(false)
+    private val logBuffer = ConcurrentLinkedDeque<TrafficLogEntry>()
+
+    private val _state = MutableStateFlow(VpnRuntimeState())
+    val state: StateFlow<VpnRuntimeState> = _state.asStateFlow()
+
+    fun setUiVisible(visible: Boolean) {
+        uiVisible = visible
+        if (visible) {
+            flushTelemetryNow()
+        }
+    }
+
+    @Synchronized
+    fun ensureInitialized(context: Context) {
+        if (!initialized || !storageMigrated) {
+            val repo = FilterSourceRepository(context.applicationContext)
+            initialize(context.applicationContext, repo.loadSources())
+        }
+    }
+
+    @Synchronized
+    fun initialize(context: Context, sources: List<FilterSource>) {
+        val wasMigrated = storageMigrated
+        val dpCtx = deviceProtectedContext(context)
+        if (!wasMigrated && storageMigrated) {
+            (activeVpnService as? XPrivacyVpnService)?.onFirewallBypassChanged()
+        }
+        runCatching {
+            dpCtx.getSharedPreferences("xprivacy_wg_prefs", Context.MODE_PRIVATE).edit().clear().apply()
+        }
+
+        val prefs = dpCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val dnsFilter = prefs.getBoolean(KEY_DNS_FILTER, true)
+        val deepInspect = prefs.getBoolean(KEY_DEEP_INSPECT, true)
+        val nxDomain = prefs.getBoolean(KEY_USE_NXDOMAIN, false)
+        val autoStart = prefs.getBoolean(KEY_AUTO_START_BOOT, true)
+
+        val ztDns = loadZeroTrustDnsConfig(dpCtx)
+        val confText = loadWireGuardConfText(dpCtx)
+        val parsed = WireGuardConfig.parse(confText).getOrNull()
+        val bypassed = loadBypassedPackages(dpCtx)
+        val effectiveBypassed = FirewallManager.expandBypassPackages(bypassed)
+
+        filterEngine.loadSources(sources)
+        initialized = true
+
+        _state.update { current ->
+            current.copy(
+                endpoint = parsed?.endpoint ?: "Not Configured",
+                tunnelAddresses = parsed?.addresses?.joinToString(", ") ?: "Import a .conf file in WG Conf tab",
+                tunnelDns = ztDns.activeModeSummary(),
+                zeroTrustDns = ztDns,
+                dnsFilteringEnabled = dnsFilter,
+                deepInspectionEnabled = deepInspect,
+                useNxDomain = nxDomain,
+                autoStartOnBoot = autoStart,
+                bypassedPackages = bypassed,
+                effectiveBypassedPackages = effectiveBypassed,
+                filterStats = filterEngine.stats
+            )
+        }
+    }
+
+    fun loadBypassedPackages(context: Context): Set<String> {
+        val prefs = deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val stored = prefs.getStringSet(KEY_BYPASSED_PACKAGES, emptySet()) ?: emptySet()
+        return stored.map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+    }
+
+    fun saveBypassedPackages(
+        context: Context,
+        packages: Set<String>,
+        installedApps: List<InstalledAppInfo> = emptyList()
+    ) {
+        val cleaned = packages.map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+        deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putStringSet(KEY_BYPASSED_PACKAGES, cleaned)
+            .apply()
+
+        val pm = context.packageManager
+        val effective = FirewallManager.expandBypassPackages(
+            selectedPackages = cleaned,
+            installedApps = installedApps,
+            sharedUidLookup = { uid -> runCatching { pm.getPackagesForUid(uid) }.getOrNull() }
+        )
+
+        _state.update {
+            it.copy(
+                bypassedPackages = cleaned,
+                effectiveBypassedPackages = effective
+            )
+        }
+
+        val currentStatus = _state.value.status
+        if (currentStatus == TunnelStatus.CONNECTED || currentStatus == TunnelStatus.CONNECTING) {
+            (activeVpnService as? XPrivacyVpnService)?.onFirewallBypassChanged()
+        }
+    }
+
+    fun refreshEffectiveBypassWithInstalledApps(context: Context, installedApps: List<InstalledAppInfo>) {
+        val currentSelected = _state.value.bypassedPackages.ifEmpty { loadBypassedPackages(context) }
+        val pm = context.packageManager
+        val effective = FirewallManager.expandBypassPackages(
+            selectedPackages = currentSelected,
+            installedApps = installedApps,
+            sharedUidLookup = { uid -> runCatching { pm.getPackagesForUid(uid) }.getOrNull() }
+        )
+        _state.update {
+            it.copy(
+                bypassedPackages = currentSelected,
+                effectiveBypassedPackages = effective
+            )
+        }
+    }
+
+    fun resolveEffectiveBypassPackages(context: Context): Set<String> {
+        val selected = _state.value.bypassedPackages.ifEmpty { loadBypassedPackages(context) }
+        if (selected.isEmpty()) return emptySet()
+        val pm = context.packageManager
+        val installed = runCatching { FirewallManager.loadInstalledApps(context) }.getOrDefault(emptyList())
+        return FirewallManager.expandBypassPackages(
+            selectedPackages = selected,
+            installedApps = installed,
+            sharedUidLookup = { uid -> runCatching { pm.getPackagesForUid(uid) }.getOrNull() }
+        )
+    }
+
+    fun loadZeroTrustDnsConfig(context: Context): ZeroTrustDnsConfig {
+        val prefs = deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedDomain = prefs.getString(KEY_PRIVATE_DNS_DOMAIN, null)?.trim().orEmpty()
+        val savedServer = prefs.getString(KEY_PRIVATE_DNS_SERVER, null)?.trim().orEmpty()
+        return ZeroTrustDnsConfig(
+            ipv4Primary = prefs.getString(KEY_ZT_IPV4_PRIMARY, null)?.trim().orEmpty(),
+            ipv4Secondary = prefs.getString(KEY_ZT_IPV4_SECONDARY, null)?.trim().orEmpty(),
+            sourceIpv4 = prefs.getString(KEY_ZT_SOURCE_IPV4, null)?.trim().orEmpty(),
+            ipv6Endpoint = prefs.getString(KEY_ZT_IPV6, null)?.trim().orEmpty(),
+            sourceIpv6 = prefs.getString(KEY_ZT_SOURCE_IPV6, null)?.trim().orEmpty(),
+            dotEndpoint = prefs.getString(KEY_ZT_DOT, null)?.trim().orEmpty(),
+            dohEndpoint = prefs.getString(KEY_ZT_DOH, null)?.trim().orEmpty(),
+            privateDomain = savedDomain,
+            privateDnsServer = savedServer
+        )
+    }
+
+    fun saveZeroTrustDnsConfig(context: Context, config: ZeroTrustDnsConfig) {
+        val cleaned = ZeroTrustDnsConfig(
+            ipv4Primary = config.ipv4Primary.trim(),
+            ipv4Secondary = config.ipv4Secondary.trim(),
+            sourceIpv4 = config.sourceIpv4.trim(),
+            ipv6Endpoint = config.ipv6Endpoint.trim(),
+            sourceIpv6 = config.sourceIpv6.trim(),
+            dotEndpoint = config.dotEndpoint.trim(),
+            dohEndpoint = config.dohEndpoint.trim(),
+            privateDomain = config.privateDomain.trim().trim(46.toChar()).lowercase(),
+            privateDnsServer = config.privateDnsServer.trim()
+        )
+        deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_ZT_IPV4_PRIMARY, cleaned.ipv4Primary)
+            .putString(KEY_ZT_IPV4_SECONDARY, cleaned.ipv4Secondary)
+            .putString(KEY_ZT_SOURCE_IPV4, cleaned.sourceIpv4)
+            .putString(KEY_ZT_IPV6, cleaned.ipv6Endpoint)
+            .putString(KEY_ZT_SOURCE_IPV6, cleaned.sourceIpv6)
+            .putString(KEY_ZT_DOT, cleaned.dotEndpoint)
+            .putString(KEY_ZT_DOH, cleaned.dohEndpoint)
+            .putString(KEY_PRIVATE_DNS_DOMAIN, cleaned.privateDomain)
+            .putString(KEY_PRIVATE_DNS_SERVER, cleaned.privateDnsServer)
+            .apply()
+
+        ZeroTrustDnsResolver.clearCaches()
+
+        _state.update {
+            it.copy(
+                zeroTrustDns = cleaned,
+                tunnelDns = cleaned.activeModeSummary()
+            )
+        }
+    }
+
+    fun isAutoStartOnBootEnabled(context: Context): Boolean {
+        val prefs = deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_AUTO_START_BOOT, true)
+    }
+
+    fun updateFilterSources(sources: List<FilterSource>) {
+        filterEngine.loadSources(sources)
+        _state.update { it.copy(filterStats = filterEngine.stats) }
+    }
+
+    fun updateScreenState(isScreenOn: Boolean) {
+        _state.update {
+            it.copy(
+                isScreenOn = isScreenOn,
+                dynamicKeepaliveSec = 0
+            )
+        }
+    }
+
+    fun loadWireGuardConfText(context: Context): String {
+        val prefs = deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val saved = prefs.getString(KEY_WG_CONF, "") ?: ""
+        return saved
+    }
+
+    fun resetToDefaultStaticConfig(context: Context): Result<WireGuardConfig> {
+        return Result.failure(IllegalStateException("Import your own WireGuard configuration first."))
+    }
+
+    fun exportConfigFile(context: Context): String? {
+        val confText = loadWireGuardConfText(context)
+        return try {
+            val fileName = "xPrivacyVPN.conf"
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                val resolver = context.contentResolver
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                    put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: return null
+                resolver.openOutputStream(uri)?.use { os ->
+                    os.write(confText.toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                }
+                "Downloads/$fileName"
+            } else {
+                val dir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+                val target = java.io.File(dir, fileName)
+                java.io.FileOutputStream(target).use { os ->
+                    os.write(confText.toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                }
+                target.absolutePath
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun saveWireGuardConfText(context: Context, confText: String): Result<WireGuardConfig> {
+        val result = WireGuardConfig.parse(confText)
+        result.onSuccess { cfg ->
+            deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_WG_CONF, confText)
+                .apply()
+            _state.update {
+                it.copy(
+                    endpoint = cfg.endpoint,
+                    tunnelAddresses = cfg.addresses.joinToString(", ")
+                )
+            }
+        }
+        return result
+    }
+
+    fun clearWireGuardConf(context: Context) {
+        deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .remove(KEY_WG_CONF)
+            .apply()
+        _state.update {
+            it.copy(
+                endpoint = "Not Configured",
+                tunnelAddresses = "Import a .conf file in WG Conf tab"
+            )
+        }
+    }
+
+    fun setFilterSettings(
+        context: Context,
+        dnsFilteringEnabled: Boolean = _state.value.dnsFilteringEnabled,
+        deepInspectionEnabled: Boolean = _state.value.deepInspectionEnabled,
+        useNxDomain: Boolean = _state.value.useNxDomain,
+        autoStartOnBoot: Boolean = _state.value.autoStartOnBoot
+    ) {
+        deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_DNS_FILTER, dnsFilteringEnabled)
+            .putBoolean(KEY_DEEP_INSPECT, deepInspectionEnabled)
+            .putBoolean(KEY_USE_NXDOMAIN, useNxDomain)
+            .putBoolean(KEY_AUTO_START_BOOT, autoStartOnBoot)
+            .apply()
+
+        _state.update {
+            it.copy(
+                dnsFilteringEnabled = dnsFilteringEnabled,
+                deepInspectionEnabled = deepInspectionEnabled,
+                useNxDomain = useNxDomain,
+                autoStartOnBoot = autoStartOnBoot
+            )
+        }
+    }
+
+    fun updateStatus(
+        status: TunnelStatus,
+        message: String,
+        handshakeEstablished: Boolean = _state.value.handshakeEstablished,
+        lastHandshakeMs: Long = _state.value.lastHandshakeMs
+    ) {
+        _state.update {
+            it.copy(
+                status = status,
+                statusMessage = message,
+                handshakeEstablished = handshakeEstablished,
+                lastHandshakeMs = lastHandshakeMs,
+                rxBytes = rxBytesCounter.get(),
+                txBytes = txBytesCounter.get(),
+                blockedCount = blockedCounter.get(),
+                allowedCount = allowedCounter.get()
+            )
+        }
+    }
+
+    fun addRxBytes(bytes: Int) {
+        if (bytes <= 0) return
+        rxBytesCounter.addAndGet(bytes.toLong())
+        maybePublishTelemetry()
+    }
+
+    fun addTxBytes(bytes: Int) {
+        if (bytes <= 0) return
+        txBytesCounter.addAndGet(bytes.toLong())
+        maybePublishTelemetry()
+    }
+
+    fun recordTrafficEvent(
+        target: String,
+        protocol: String,
+        blocked: Boolean,
+        matchedRule: String?,
+        sourceName: String?
+    ) {
+        if (blocked) {
+            blockedCounter.incrementAndGet()
+        } else {
+            allowedCounter.incrementAndGet()
+            // When the app UI is not on screen, skip allocating log entries for allowed traffic
+            if (!uiVisible) return
+        }
+
+        val now = System.currentTimeMillis()
+        val head = logBuffer.peekFirst()
+        if (head == null || head.target != target || head.blocked != blocked || now - head.timestampMs > 1500L) {
+            val entry = TrafficLogEntry(
+                id = logIdSequence.incrementAndGet().toString(),
+                timestampMs = now,
+                target = target,
+                protocol = protocol,
+                blocked = blocked,
+                matchedRule = matchedRule,
+                sourceName = sourceName
+            )
+            logBuffer.addFirst(entry)
+            while (logBuffer.size > MAX_LOG_ENTRIES) {
+                logBuffer.pollLast()
+            }
+            logsDirty.set(true)
+        }
+
+        maybePublishTelemetry()
+    }
+
+    private fun maybePublishTelemetry() {
+        if (!uiVisible) return
+        val now = System.currentTimeMillis()
+        val prev = lastTelemetryPublishMs.get()
+        if (now - prev < TELEMETRY_FLUSH_INTERVAL_MS) return
+        if (!lastTelemetryPublishMs.compareAndSet(prev, now)) return
+        flushTelemetryNow()
+    }
+
+    fun flushTelemetryNow() {
+        val rx = rxBytesCounter.get()
+        val tx = txBytesCounter.get()
+        val blk = blockedCounter.get()
+        val alw = allowedCounter.get()
+        val shouldCopyLogs = logsDirty.compareAndSet(true, false)
+        val snapshotLogs = if (shouldCopyLogs) logBuffer.toList() else null
+
+        _state.update { current ->
+            current.copy(
+                rxBytes = rx,
+                txBytes = tx,
+                blockedCount = blk,
+                allowedCount = alw,
+                recentLogs = snapshotLogs ?: current.recentLogs
+            )
+        }
+    }
+
+    fun clearLogs() {
+        logBuffer.clear()
+        blockedCounter.set(0L)
+        allowedCounter.set(0L)
+        logsDirty.set(false)
+        _state.update { it.copy(recentLogs = emptyList(), blockedCount = 0L, allowedCount = 0L) }
+    }
+}
