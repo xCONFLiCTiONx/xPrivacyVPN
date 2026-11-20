@@ -46,17 +46,19 @@ Before enabling the Aether tunnel under the Android VPN service, we must add a t
 
 ## Implementation sequence
 
-1. Build Aether and Quiche for the Android ABIs supported by xPrivacyVPN with `scripts/build-aether-android.ps1`; it refuses to run outside `feature/cloudflare-one-masque` and writes the native libraries to `app/src/main/jniLibs`. Package them through Android Gradle.
-2. Add a Kotlin/JNI bridge for Aether's JSON C ABI, asynchronous job polling/cancellation, identity lifecycle, and team email-code authentication.
+1. **Native build wiring committed:** `scripts/build-aether-android.ps1` builds the Aether library for Android ARM64 and x86-64 into `app/src/main/jniLibs`; `app/build.gradle.kts` configures CMake and those ABIs. The script explicitly builds `--lib`, not the upstream command-line executable.
+2. **JNI bridge committed:** `app/src/main/cpp/aether_ffi.h` declares the pinned FFI signatures, `aether_jni.cpp` wraps the C ABI, and `AetherNative.kt` exposes identity, scan, verify, tunnel, job, and team-auth calls. All FFI replies remain JSON strings.
 3. Add the Android `VpnService.protect(fd)` callback to Aether's outbound socket creation path, tracked as an explicit upstream integration patch.
 4. Implement the TUN-to-SOCKS adapter after `PacketInspector`, preserving current DNS handling, filtering, logging, app selection, and firewall behavior.
 5. Keep the existing WireGuard transport selectable until Aether MASQUE passes device-level connection, traffic, reconnect, sleep/wake, IPv4/IPv6, DNS, and leak tests.
 
+The native build, JNI compilation, and device execution have **not** been run in this remote repository-editing session. The Kotlin facade intentionally does not load or start Aether until a caller invokes it, and it does not imply that socket protection or packet forwarding is implemented.
+
 ## Current test status
 
 - Git submodule pointer: committed and pinned.
-- Aether native Android build: not run.
-- Kotlin/JNI bridge: not implemented.
+- Aether native Android build: script and Gradle/CMake wiring committed; not run.
+- Kotlin/JNI bridge: source committed; not compiled or device-tested.
 - Socket protection callback: not implemented.
 - TUN-to-SOCKS adapter: not implemented.
 - End-to-end Cloudflare test: not run.
