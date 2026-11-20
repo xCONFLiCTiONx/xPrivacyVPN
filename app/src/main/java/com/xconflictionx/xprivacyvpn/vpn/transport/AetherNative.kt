@@ -1,11 +1,14 @@
 package com.xconflictionx.xprivacyvpn.vpn.transport
 
+import kotlinx.coroutines.delay
+import org.json.JSONObject
+
 /**
  * Thin JNI facade for Aether's upstream JSON C ABI.
  *
- * All returned strings are JSON replies. Job-producing calls return a job handle;
- * callers must poll and eventually free that handle. This class deliberately does
- * not claim to provide Android socket protection or TUN packet forwarding yet.
+ * Async operations return {"job": id}; awaitJob() polls the job and returns its
+ * final JSON result. This facade does not claim to provide Android socket
+ * protection or TUN packet forwarding yet.
  */
 object AetherNative {
     init {
@@ -30,4 +33,45 @@ object AetherNative {
     external fun nativeTeamSessionFree(session: Long): String
     external fun nativeTeamTokenSet(token: String): String
     external fun nativeTeamTokenClear(): String
+
+    /**
+     * Poll an Aether asynchronous operation until it finishes.
+     *
+     * The returned JSONObject is the completed operation's result (including
+     * its "ok" field). The native job handle is always released.
+     */
+    suspend fun awaitJob(startReply: String, timeoutMs: Long = 180_000L): JSONObject {
+        val start = JSONObject(startReply)
+        if (!start.optBoolean("ok", false)) {
+            throw IllegalStateException(start.optString("error", "Aether operation could not start"))
+        }
+        val jobId = start.optLong("job", 0L)
+        require(jobId > 0L) { "Aether did not return a valid job handle" }
+
+        val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
+        try {
+            while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                val poll = JSONObject(nativeJobPoll(jobId))
+                if (!poll.optBoolean("ok", false)) {
+                    throw IllegalStateException(poll.optString("error", "Aether job polling failed"))
+                }
+                when (poll.optString("state")) {
+                    "running" -> delay(150L)
+                    "done" -> {
+                        val result = poll.optJSONObject("result")
+                            ?: throw IllegalStateException("Aether returned an empty job result")
+                        if (!result.optBoolean("ok", false)) {
+                            throw IllegalStateException(result.optString("error", "Aether operation failed"))
+                        }
+                        return result
+                    }
+                    else -> throw IllegalStateException("Unknown Aether job state: ${poll.optString("state")}")
+                }
+            }
+            nativeJobCancel(jobId)
+            throw kotlinx.coroutines.TimeoutCancellationException("Aether operation timed out after ${timeoutMs}ms")
+        } finally {
+            nativeJobFree(jobId)
+        }
+    }
 }
