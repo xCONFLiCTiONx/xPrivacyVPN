@@ -43,6 +43,29 @@ if (-not (Test-Path $Manifest)) {
     throw "Aether Cargo manifest not found: $Manifest"
 }
 
+$AetherPatch = Join-Path $RepoRoot "patches/aether/0001-android-vpnservice-socket-protection.patch"
+if (-not (Test-Path $AetherPatch)) {
+    throw "Required Android socket-protection patch is missing: $AetherPatch"
+}
+Push-Location $AetherPath
+try {
+    git apply --reverse --check $AetherPatch 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Aether Android socket-protection patch is already applied."
+    } else {
+        git apply --check $AetherPatch
+        if ($LASTEXITCODE -ne 0) {
+            throw "The Android socket-protection patch does not apply cleanly to the pinned Aether revision."
+        }
+        git apply $AetherPatch
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to apply the Android socket-protection patch."
+        }
+    }
+} finally {
+    Pop-Location
+}
+
 $TargetMap = @{
     "arm64-v8a" = "aarch64-linux-android"
     "x86_64" = "x86_64-linux-android"
