@@ -79,6 +79,7 @@ $CargoNdkArgs += @(
     "-p", "$ApiLevel",
     "-o", $OutputDir,
     "build",
+    "--lib",
     "--manifest-path", $Manifest,
     "--release"
 )
