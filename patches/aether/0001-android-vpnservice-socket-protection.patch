@@ -7,6 +7,7 @@ diff --git a/aether/src/egress.rs b/aether/src/egress.rs
 -use std::sync::atomic::{AtomicU32, Ordering};
 +use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
  use std::time::Duration;
++#[cfg(target_os = "android")]
 +use std::os::fd::AsRawFd;
  
  use futures::stream::{FuturesUnordered, StreamExt};
