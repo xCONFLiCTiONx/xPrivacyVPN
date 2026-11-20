@@ -8,8 +8,8 @@ import java.util.concurrent.TimeoutException
  * Thin JNI facade for Aether's upstream JSON C ABI.
  *
  * Async operations return {"job": id}; awaitJob() polls the job and returns its
- * final JSON result. This facade does not claim to provide Android socket
- * protection or TUN packet forwarding yet.
+ * final JSON result. Socket protection must be registered with the active VPN service
+ * before any Aether operation that can open an outbound socket.
  */
 object AetherNative {
     init {
@@ -17,6 +17,7 @@ object AetherNative {
         System.loadLibrary("xprivacy_aether_jni")
     }
 
+    external fun nativeRegisterSocketProtector(service: android.net.VpnService?): Boolean
     external fun nativeVersion(): String
     external fun nativeIdentityOpen(payloadJson: String): String
     external fun nativeIdentitySummary(identity: Long): String
@@ -34,6 +35,22 @@ object AetherNative {
     external fun nativeTeamSessionFree(session: Long): String
     external fun nativeTeamTokenSet(token: String): String
     external fun nativeTeamTokenClear(): String
+
+    /**
+     * Register Android's VPN socket-protection callback before starting Aether jobs.
+     * Pass null only after all Aether jobs and sockets have stopped.
+     */
+    fun registerSocketProtector(service: android.net.VpnService) {
+        check(nativeRegisterSocketProtector(service)) {
+            "Unable to register Android VpnService socket protection"
+        }
+    }
+
+    fun unregisterSocketProtector() {
+        check(nativeRegisterSocketProtector(null)) {
+            "Unable to unregister Android VpnService socket protection"
+        }
+    }
 
     /**
      * Poll an Aether asynchronous operation until it finishes.
