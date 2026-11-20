@@ -69,3 +69,23 @@ diff --git a/aether/src/ffi.rs b/aether/src/ffi.rs
 +}
 +
  fn identity_of(id: u64) -> std::result::Result<Arc<Identity>, String> {
+diff --git a/aether/src/prober.rs b/aether/src/prober.rs
+--- a/aether/src/prober.rs
++++ b/aether/src/prober.rs
+@@ -1186,7 +1186,7 @@
+         } else {
+             "[::]:0"
+         };
+-        let sock = tokio::net::UdpSocket::bind(bind).await.ok()?;
++        let sock = crate::egress::udp_bind(bind.parse().ok()?).ok()?;
+         sock.connect(peer).await.ok()?;
+         let local = sock.local_addr().ok()?;
+ 
+@@ -1221,7 +1221,7 @@
+     async fn tcp_answers(peer: SocketAddr, timeout: Duration) -> Option<Duration> {
+         let started = Instant::now();
+-        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(peer)).await {
++        match tokio::time::timeout(timeout, crate::egress::tcp_connect(peer)).await {
+             Ok(Ok(_)) => Some(started.elapsed()),
+             _ => None,
+         }
