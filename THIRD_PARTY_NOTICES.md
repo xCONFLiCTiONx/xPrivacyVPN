@@ -1,13 +1,13 @@
-# Aether integration notice
+# Third-party notices
 
-xPrivacyVPN incorporates Aether as an unmodified Git submodule at `third_party/Aether`.
+## Aether
 
-- Upstream project: https://github.com/CluvexStudio/Aether
-- Upstream revision: `ef06971101ba3d4b30f0bb317a2bba81c9b55ca2`
-- Upstream license: GNU Affero General Public License v3.0 only (AGPL-3.0-only)
-- Upstream author/project: CluvexStudio
-- Upstream trademark policy: see `third_party/Aether/TRADEMARK.md`
+Planned upstream integration: https://github.com/CluvexStudio/Aether
 
-The Aether source, its own license, trademark policy, `quiche` source, `license-texts/`, and third-party notices remain in the upstream submodule without being rewritten or renamed.
+Pinned upstream revision for the integration work: `ef06971101ba3d4b30f0bb317a2bba81c9b55ca2`.
 
-xPrivacyVPN's project-level licensing is aligned to AGPL-3.0-only for this combined-work development branch. This notice does not claim ownership of Aether or its third-party dependencies. Any later modifications to Aether will be identified in the relevant source history and notices.
+Aether is authored by CluvexStudio and is licensed under the GNU Affero General Public License v3.0 only (AGPL-3.0-only). Its trademark policy is separate from its source-code license; see the upstream `TRADEMARK.md`. Do not use Aether's name, logo, or branding for xPrivacyVPN.
+
+When vendoring Aether, preserve its source tree, original LICENSE, TRADEMARK.md, `quiche/`, `license-texts/`, and generated third-party notices intact. Do not overwrite upstream notices with xPrivacyVPN notices.
+
+xPrivacyVPN's top-level LICENSE on this development branch is aligned to the AGPL-3.0 text. This file records attribution and the exact upstream revision; it does not claim ownership of Aether or any third-party components.
