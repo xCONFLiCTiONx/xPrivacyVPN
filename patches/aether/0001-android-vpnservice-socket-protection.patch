@@ -52,6 +52,13 @@ diff --git a/aether/src/ffi.rs b/aether/src/ffi.rs
  #![allow(clippy::missing_safety_doc)]
  
  use std::collections::HashMap;
+@@ -17,6 +17,7 @@
+ use crate::account::Identity;
+ use crate::api;
++use crate::egress::{self, AndroidSocketProtector};
+ use crate::zerotrust;
+ 
+ type Reply = std::result::Result<Value, String>;
 @@ -100,6 +101,13 @@
  }
  
