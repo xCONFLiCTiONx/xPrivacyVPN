@@ -48,8 +48,7 @@ diff --git a/aether/src/egress.rs b/aether/src/egress.rs
 diff --git a/aether/src/ffi.rs b/aether/src/ffi.rs
 --- a/aether/src/ffi.rs
 +++ b/aether/src/ffi.rs
-@@ -1,3 +1,4 @@
-+use crate::egress::{self, AndroidSocketProtector};
+@@ -1,3 +1,3 @@
  #![allow(clippy::missing_safety_doc)]
  
  use std::collections::HashMap;
