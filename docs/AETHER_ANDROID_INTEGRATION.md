@@ -64,3 +64,22 @@ The native build, JNI compilation, and device execution have **not** been run in
 - End-to-end Cloudflare test: not run.
 
 This status is intentional: source inclusion is complete, but the app must not report an Aether/Cloudflare connection before the native tunnel and packet path are actually working.
+
+## Android socket-protection implementation contract
+
+The pinned Aether source file aether/src/egress.rs confirms that egress::apply(SockRef) is called before the TCP connect and UDP bind helpers. Its current Android path only applies the optional Linux socket mark (SO_MARK); that is not a substitute for VpnService.protect(fd) in an unprivileged app.
+
+The Android patch must add a process-wide, thread-safe C callback registration point to the Aether FFI. The callback contract is:
+
+- Input: the already-created socket's raw file descriptor, before connect or bind.
+- Return: success only when Android VpnService.protect(fd) returns true.
+- Failure: return an I/O error and abort that socket operation. Never silently continue with an unprotected socket.
+- Lifetime: register the callback before starting scan/verify/tunnel jobs; unregister only after all Aether jobs and sockets have stopped.
+- Threading: JNI must attach Rust worker threads to the JVM as needed, hold a global reference to the live service, and release it during teardown. Do not retain a local JNI reference or call through a destroyed service.
+- Coverage: audit every MASQUE/QUIC, TCP, UDP, DNS, and endpoint-probe socket creation path. The egress helpers cover their callers, but a raw socket created elsewhere must be routed through the same protection hook.
+
+The Kotlin side must pass the active XPrivacyVpnService instance to a JNI registration method. The JNI callback calls the public VpnService.protect(int) method and propagates its boolean result to Rust. This is a required upstream integration patch; it is not implemented by the current JNI facade.
+
+## Job cancellation correction
+
+AetherNative.awaitJob() now cancels the native job on every unsuccessful exit path, including coroutine cancellation, timeout, malformed poll responses, and native polling errors, before releasing the job handle. A completed job is only freed. This prevents a canceled Kotlin caller from leaving a Rust worker running in the background.
