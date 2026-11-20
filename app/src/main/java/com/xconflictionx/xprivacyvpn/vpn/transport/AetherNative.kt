@@ -50,6 +50,7 @@ object AetherNative {
         require(jobId > 0L) { "Aether did not return a valid job handle" }
 
         val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
+        var completed = false
         try {
             while (android.os.SystemClock.elapsedRealtime() < deadline) {
                 val poll = JSONObject(nativeJobPoll(jobId))
@@ -64,15 +65,18 @@ object AetherNative {
                         if (!result.optBoolean("ok", false)) {
                             throw IllegalStateException(result.optString("error", "Aether operation failed"))
                         }
+                        completed = true
                         return result
                     }
                     else -> throw IllegalStateException("Unknown Aether job state: ${poll.optString("state")}")
                 }
             }
-            nativeJobCancel(jobId)
             throw TimeoutException("Aether operation timed out after ${timeoutMs}ms")
         } finally {
-            nativeJobFree(jobId)
+            // A canceled coroutine, malformed poll response, or timeout must not leave
+            // the Rust task running after its handle is released.
+            if (!completed) runCatching { nativeJobCancel(jobId) }
+            runCatching { nativeJobFree(jobId) }
         }
     }
 }
