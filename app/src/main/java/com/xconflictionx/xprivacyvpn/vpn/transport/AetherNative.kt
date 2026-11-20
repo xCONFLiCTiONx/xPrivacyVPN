@@ -2,6 +2,7 @@ package com.xconflictionx.xprivacyvpn.vpn.transport
 
 import kotlinx.coroutines.delay
 import org.json.JSONObject
+import java.util.concurrent.TimeoutException
 
 /**
  * Thin JNI facade for Aether's upstream JSON C ABI.
@@ -69,7 +70,7 @@ object AetherNative {
                 }
             }
             nativeJobCancel(jobId)
-            throw kotlinx.coroutines.TimeoutCancellationException("Aether operation timed out after ${timeoutMs}ms")
+            throw TimeoutException("Aether operation timed out after ${timeoutMs}ms")
         } finally {
             nativeJobFree(jobId)
         }
