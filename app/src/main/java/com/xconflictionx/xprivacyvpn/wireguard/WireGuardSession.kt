@@ -14,12 +14,16 @@ class WireGuardSession(private val config: WireGuardConfig) {
     private val responderStaticPub: ByteArray = config.peerPublicKeyBytes()
     private val presharedKey: ByteArray = config.presharedKeyBytes()
 
-    // Pending handshake state
-    private var localSenderIndex: Int = 0
-    private var ephemeralPriv: ByteArray? = null
-    private var ephemeralPub: ByteArray? = null
-    private var handshakeChainingKey: ByteArray? = null
-    private var handshakeHash: ByteArray? = null
+    private data class PendingHandshake(
+        val senderIndex: Int,
+        val ephemeralPriv: ByteArray,
+        val chainingKey: ByteArray,
+        val hash: ByteArray
+    )
+
+    // Keep up to 3 recent in-flight handshakes so a slightly delayed Type 2 response
+    // from an earlier initiation is still accepted if a retry was already sent.
+    private val pendingHandshakes = ArrayDeque<PendingHandshake>(4)
 
     // Active transport session state
     @Volatile
@@ -62,15 +66,13 @@ class WireGuardSession(private val config: WireGuardConfig) {
      */
     @Synchronized
     fun createHandshakeInitiation(): ByteArray {
-        localSenderIndex = WireGuardCrypto.nextSenderIndex()
+        val senderIndex = WireGuardCrypto.nextSenderIndex()
 
         var chainingKey = WireGuardCrypto.blake2s256(WireGuardCrypto.CONSTRUCTION)
         var hash = WireGuardCrypto.blake2s256(chainingKey, WireGuardCrypto.IDENTIFIER)
         hash = WireGuardCrypto.blake2s256(hash, responderStaticPub)
 
         val (ephPriv, ephPub) = WireGuardCrypto.generateX25519KeyPair()
-        ephemeralPriv = ephPriv
-        ephemeralPub = ephPub
 
         hash = WireGuardCrypto.blake2s256(hash, ephPub)
         chainingKey = WireGuardCrypto.kdf1(chainingKey, ephPub)
@@ -90,13 +92,22 @@ class WireGuardSession(private val config: WireGuardConfig) {
         val encryptedTimestamp = WireGuardCrypto.aeadEncrypt(key2, 0L, timestamp, hash)
         hash = WireGuardCrypto.blake2s256(hash, encryptedTimestamp)
 
-        handshakeChainingKey = chainingKey
-        handshakeHash = hash
+        if (pendingHandshakes.size >= 3) {
+            pendingHandshakes.removeFirst()
+        }
+        pendingHandshakes.addLast(
+            PendingHandshake(
+                senderIndex = senderIndex,
+                ephemeralPriv = ephPriv,
+                chainingKey = chainingKey,
+                hash = hash
+            )
+        )
 
         val packet = ByteArray(148)
         val buf = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
         buf.putInt(1)
-        buf.putInt(localSenderIndex)
+        buf.putInt(senderIndex)
         buf.put(ephPub)
         buf.put(encryptedStatic)
         buf.put(encryptedTimestamp)
@@ -120,11 +131,11 @@ class WireGuardSession(private val config: WireGuardConfig) {
 
         val responderIndex = buf.int
         val receiverIndex = buf.int
-        if (receiverIndex != localSenderIndex) return false
+        val pending = pendingHandshakes.lastOrNull { it.senderIndex == receiverIndex } ?: return false
 
-        val ephPriv = ephemeralPriv ?: return false
-        var chainingKey = handshakeChainingKey ?: return false
-        var hash = handshakeHash ?: return false
+        val ephPriv = pending.ephemeralPriv
+        var chainingKey = pending.chainingKey
+        var hash = pending.hash
 
         val expectedMac1Key = WireGuardCrypto.blake2s256(WireGuardCrypto.LABEL_MAC1, initiatorStaticPub)
         val expectedMac1 = WireGuardCrypto.blake2s128Keyed(expectedMac1Key, packet, 60)
@@ -166,14 +177,11 @@ class WireGuardSession(private val config: WireGuardConfig) {
         receivingKeyParam = KeyParameter(rxKey)
 
         peerReceiverIndex = responderIndex
-        activeLocalIndex = localSenderIndex
+        activeLocalIndex = pending.senderIndex
         sendCounter.set(0L)
         lastHandshakeEpochMs = System.currentTimeMillis()
 
-        ephemeralPriv = null
-        ephemeralPub = null
-        handshakeChainingKey = null
-        handshakeHash = null
+        pendingHandshakes.clear()
 
         return true
     }

@@ -528,7 +528,11 @@ private fun DashboardScreen(
                     }
                 }
                 Text(
-                    text = "PersistentKeepalive = ${state.dynamicKeepaliveSec}s • Keepalives are used only when requested by your imported profile.",
+                    text = if (state.isScreenOn) {
+                        "Warm Keepalive = ${state.dynamicKeepaliveSec}s (Screen On) • Drops to 0s zero-drain idle when screen turns off."
+                    } else {
+                        "Ultra-Low-Power Idle = 0s (Screen Off) • Instant 1-RTT wake on screen-on or app traffic."
+                    },
                     fontSize = 12.sp,
                     color = Color(0xFF94A3B8)
                 )

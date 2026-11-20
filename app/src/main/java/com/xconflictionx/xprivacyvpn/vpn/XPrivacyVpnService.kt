@@ -18,6 +18,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import com.xconflictionx.xprivacyvpn.MainActivity
 import com.xconflictionx.xprivacyvpn.R
 import com.xconflictionx.xprivacyvpn.config.WireGuardConfig
@@ -59,9 +60,10 @@ class XPrivacyVpnService : VpnService() {
         private const val REKEY_AFTER_TIME_MS = 120_000L
         private const val REJECT_AFTER_TIME_MS = 175_000L
         private const val STALE_RX_REHANDSHAKE_MS = 30_000L
-        private const val HANDSHAKE_BASE_RETRY_MS = 2_000L
-        private const val HANDSHAKE_MAX_BACKOFF_MS = 15_000L
-        private const val MAX_PENDING_PACKETS = 32
+        private const val HANDSHAKE_BASE_RETRY_MS = 1_200L
+        private const val HANDSHAKE_MAX_BACKOFF_MS = 12_000L
+        private const val MAX_PENDING_PACKETS = 64
+        private const val SCREEN_ON_KEEPALIVE_SEC = 25
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -105,6 +107,7 @@ class XPrivacyVpnService : VpnService() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     private val hasPhysicalNetwork = AtomicBoolean(true)
+    private val isScreenInteractive = AtomicBoolean(true)
     private val unansweredHandshakeCount = AtomicInteger(0)
     private val lastTxEpochMs = AtomicLong(0L)
     private val lastRxEpochMs = AtomicLong(0L)
@@ -112,7 +115,17 @@ class XPrivacyVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        val interactive = runCatching {
+            (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive ?: true
+        }.getOrDefault(true)
+        isScreenInteractive.set(interactive)
+        VpnStateManager.updateScreenState(interactive, effectiveScreenOnKeepaliveSec())
         registerScreenStateReceiver()
+    }
+
+    private fun effectiveScreenOnKeepaliveSec(): Int {
+        val profileKa = activeConfig?.persistentKeepalive ?: 0
+        return if (profileKa in 10..SCREEN_ON_KEEPALIVE_SEC) profileKa else SCREEN_ON_KEEPALIVE_SEC
     }
 
     override fun onBind(intent: Intent?): IBinder? {
@@ -214,6 +227,31 @@ class XPrivacyVpnService : VpnService() {
                 runCatching { tunInterface?.close() }
                 tunInterface = null
                 startVpnTunnel()
+            }
+        }
+    }
+
+    /**
+     * Called on USER_PRESENT / boot broadcasts when the tunnel is already running.
+     * Only rebuilds the TUN interface if the effective allowed package list or DNS config
+     * actually changed (e.g., right after Direct Boot unlock); otherwise leaves the
+     * established WireGuard session intact so unlocking the phone never drops the VPN.
+     */
+    fun syncTunnelIfConfigChanged() {
+        serviceScope.launch(Dispatchers.IO) {
+            VpnStateManager.ensureInitialized(applicationContext)
+            val expectedAllowed = computeAllowedTunnelPackages()
+            val currentZtDns = VpnStateManager.state.value.zeroTrustDns
+            val expectedTunDns = computeTunDnsServers(currentZtDns, activeConfig)
+            val needsRebuild = tunnelJob?.isActive != true ||
+                tunInterface == null ||
+                appliedBypassPackages != expectedAllowed ||
+                appliedTunDnsServers != expectedTunDns
+
+            if (needsRebuild) {
+                onFirewallBypassChanged()
+            } else {
+                warmSessionIfStale()
             }
         }
     }
@@ -386,8 +424,12 @@ class XPrivacyVpnService : VpnService() {
                     val oldNetwork = currentPhysicalNetwork
                     currentPhysicalNetwork = network
                     runCatching { setUnderlyingNetworks(arrayOf(network)) }
-                    val networkChanged = oldNetwork == null || oldNetwork != network
-                    if (networkChanged) {
+                    // Only rebind when switching between two distinct physical networks, or if
+                    // we have no live socket yet. Avoid tearing down the initial socket during
+                    // startVpnTunnel() startup when oldNetwork transitions from null -> network.
+                    val switchedNetworks = oldNetwork != null && oldNetwork != network
+                    val missingSocket = udpSocket == null || udpSocket?.isClosed == true
+                    if (switchedNetworks || (activeWgSession != null && missingSocket)) {
                         onPhysicalNetworkChanged(network, forceSocketRecreate = true)
                     }
                 }
@@ -738,24 +780,39 @@ class XPrivacyVpnService : VpnService() {
         lastHandshakeAttemptEpochMs.set(now)
 
         val currentFailures = unansweredHandshakeCount.incrementAndGet()
-        // If 2 consecutive handshakes went unanswered, recreate the UDP socket asynchronously so we never block the TUN loop
+        // If 2 consecutive handshakes went unanswered, recreate the UDP socket asynchronously
+        // and immediately send a fresh handshake on the newly bound socket.
         if (currentFailures >= 2 && activeConfig != null && isRebindingSocket.compareAndSet(false, true)) {
             val cfg = activeConfig!!
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     rebindUdpSocketAndReceiver(cfg, wgSession)
+                    val freshSock = udpSocket
+                    val freshPeer = activePeerAddress ?: peerAddress
+                    if (freshSock != null && !freshSock.isClosed) {
+                        sendHandshakePacket(wgSession, freshSock, freshPeer)
+                    }
                 } finally {
                     isRebindingSocket.set(false)
                 }
             }
+            return
         }
         val activeSock = udpSocket ?: socket
-
         val targetPeer = activePeerAddress ?: peerAddress
+        sendHandshakePacket(wgSession, activeSock, targetPeer)
+    }
+
+    private fun sendHandshakePacket(
+        wgSession: WireGuardSession,
+        socket: DatagramSocket,
+        targetPeer: InetSocketAddress
+    ) {
+        val now = System.currentTimeMillis()
         runCatching {
-            protect(activeSock)
+            protect(socket)
             val initPkt = wgSession.createHandshakeInitiation()
-            activeSock.send(DatagramPacket(initPkt, initPkt.size, targetPeer))
+            socket.send(DatagramPacket(initPkt, initPkt.size, targetPeer))
             lastTxEpochMs.set(now)
             VpnStateManager.addTxBytes(initPkt.size)
         }
@@ -779,7 +836,9 @@ class XPrivacyVpnService : VpnService() {
                 pendingOutboundPackets.poll()
             }
             pendingOutboundPackets.offer(ipPacket.copyOf(length))
-            triggerHandshakeIfAllowed(wgSession, socket, peerAddress, force = hsAge > REJECT_AFTER_TIME_MS)
+            // Never pass force = true per packet — let the handshake cooldown prevent a packet
+            // burst from spamming initiations and triggering premature socket rebinds.
+            triggerHandshakeIfAllowed(wgSession, socket, peerAddress, force = false)
             return
         }
 
@@ -855,6 +914,30 @@ class XPrivacyVpnService : VpnService() {
         super.onDestroy()
     }
 
+    private fun warmSessionIfStale() {
+        val sock = udpSocket ?: return
+        val peer = activePeerAddress ?: return
+        val session = activeWgSession ?: return
+
+        val now = System.currentTimeMillis()
+        val hsAge = now - session.lastHandshakeEpochMs
+        val rxAge = now - lastRxEpochMs.get()
+        val lastAttemptAge = now - lastHandshakeAttemptEpochMs.get()
+        if (!session.isEstablished ||
+            hsAge > REKEY_AFTER_TIME_MS ||
+            rxAge > STALE_RX_REHANDSHAKE_MS
+        ) {
+            if (lastAttemptAge >= HANDSHAKE_BASE_RETRY_MS) {
+                unansweredHandshakeCount.set(0)
+                lastHandshakeAttemptEpochMs.set(0L)
+                triggerHandshakeIfAllowed(session, sock, peer, force = true)
+            }
+        } else {
+            // Session is fresh; send a single 32-byte keepalive to refresh carrier/router NAT pinhole
+            sendWireGuardKeepalive(sock, peer, session)
+        }
+    }
+
     private fun registerScreenStateReceiver() {
         if (screenStateReceiver != null) return
         screenStateReceiver = object : BroadcastReceiver() {
@@ -862,30 +945,22 @@ class XPrivacyVpnService : VpnService() {
                 when (intent?.action) {
                     Intent.ACTION_SCREEN_ON,
                     Intent.ACTION_USER_PRESENT -> {
-                        VpnStateManager.updateScreenState(true)
-                        val sock = udpSocket
-                        val peer = activePeerAddress
+                        val wasScreenOff = !isScreenInteractive.getAndSet(true)
+                        VpnStateManager.updateScreenState(true, effectiveScreenOnKeepaliveSec())
                         val session = activeWgSession
-                        if (sock != null && peer != null && session != null) {
+                        if (session != null) {
+                            // Restart watchdog immediately into warm screen-on cadence when waking from sleep
+                            if (wasScreenOff) {
+                                startContinuousKeepaliveAndWatchdog(session)
+                            }
                             serviceScope.launch(Dispatchers.IO) {
-                                val now = System.currentTimeMillis()
-                                val hsAge = now - session.lastHandshakeEpochMs
-                                val rxAge = now - lastRxEpochMs.get()
-                                if (!session.isEstablished ||
-                                    hsAge > REKEY_AFTER_TIME_MS ||
-                                    rxAge > STALE_RX_REHANDSHAKE_MS
-                                ) {
-                                    unansweredHandshakeCount.set(0)
-                                    lastHandshakeAttemptEpochMs.set(0L)
-                                    triggerHandshakeIfAllowed(session, sock, peer, force = true)
-                                } else if ((activeConfig?.persistentKeepalive ?: 0) > 0) {
-                                    sendWireGuardKeepalive(sock, peer, session)
-                                }
+                                warmSessionIfStale()
                             }
                         }
                     }
                     Intent.ACTION_SCREEN_OFF -> {
-                        VpnStateManager.updateScreenState(false)
+                        isScreenInteractive.set(false)
+                        VpnStateManager.updateScreenState(false, 0)
                     }
                 }
             }
@@ -899,26 +974,36 @@ class XPrivacyVpnService : VpnService() {
     }
 
     /**
-     * Continuous 24/7 keep-alive and connection health watchdog.
-     * Maintains router / carrier UDP NAT hole punching every 25 seconds regardless of screen state,
-     * and automatically triggers a rehandshake if traffic goes stale or network drops.
-     */
-    /**
-     * Low-overhead recovery. Keepalives are sent only when explicitly requested
-     * by the imported profile; otherwise idle traffic does not wake the radio.
+     * Screen-aware ultra-low-power tunnel maintainer:
+     * - Screen ON: keeps the NAT pinhole & Cloudflare Zero Trust session warm with a lightweight
+     *   25s keepalive (32 bytes) and proactive seamless rekeying at 120s so apps like xAssistant
+     *   connect instantaneously with zero handshake delay.
+     * - Screen OFF: drops to 0s keepalive and sends zero periodic rehandshakes so the cellular/Wi-Fi
+     *   modem stays in deep sleep (0% idle radio/CPU drain). The TUN stays open in the kernel; any
+     *   background traffic or screen-on event immediately triggers a single 1-RTT (~30-50ms) handshake.
      */
     private fun startContinuousKeepaliveAndWatchdog(wgSession: WireGuardSession) {
         keepaliveWatchdogJob?.cancel()
+        val activeKaSec = effectiveScreenOnKeepaliveSec()
+        VpnStateManager.updateScreenState(isScreenInteractive.get(), activeKaSec)
         keepaliveWatchdogJob = serviceScope.launch(Dispatchers.IO) {
-            val keepaliveSec = activeConfig?.persistentKeepalive?.takeIf { it > 0 } ?: 0
             while (isActive) {
+                val screenOn = isScreenInteractive.get()
+                if (!screenOn) {
+                    // Ultra-low-power idle: never wake the radio while screen is off.
+                    // Wakes immediately when ACTION_SCREEN_ON restarts this watchdog or when
+                    // an app sends a packet through TUN.
+                    delay(60_000L)
+                    continue
+                }
+
+                val keepaliveSec = effectiveScreenOnKeepaliveSec()
                 val intervalMs = when {
-                    !wgSession.isEstablished -> 5_000L
-                    keepaliveSec > 0 -> (keepaliveSec * 1000L).coerceAtMost(30_000L)
-                    else -> 30_000L
+                    !wgSession.isEstablished -> HANDSHAKE_BASE_RETRY_MS
+                    else -> (keepaliveSec * 1000L).coerceAtMost(25_000L)
                 }
                 delay(intervalMs)
-                if (!isActive) break
+                if (!isActive || !isScreenInteractive.get()) continue
 
                 val sock = udpSocket ?: continue
                 val peer = activePeerAddress ?: continue
@@ -928,13 +1013,12 @@ class XPrivacyVpnService : VpnService() {
                     val txAge = now - lastTxEpochMs.get()
                     val rxAge = now - lastRxEpochMs.get()
                     val hsAge = now - wgSession.lastHandshakeEpochMs
-                    if (keepaliveSec > 0 && txAge >= keepaliveSec * 1000L) {
-                        sendWireGuardKeepalive(sock, peer, wgSession)
-                    }
                     if (hsAge > REKEY_AFTER_TIME_MS ||
                         (rxAge > STALE_RX_REHANDSHAKE_MS && hsAge > STALE_RX_REHANDSHAKE_MS)
                     ) {
                         triggerHandshakeIfAllowed(wgSession, sock, peer)
+                    } else if (txAge >= keepaliveSec * 1000L) {
+                        sendWireGuardKeepalive(sock, peer, wgSession)
                     }
                 } else {
                     triggerHandshakeIfAllowed(wgSession, sock, peer)

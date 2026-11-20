@@ -337,11 +337,11 @@ object VpnStateManager {
         _state.update { it.copy(filterStats = filterEngine.stats) }
     }
 
-    fun updateScreenState(isScreenOn: Boolean) {
+    fun updateScreenState(isScreenOn: Boolean, keepaliveSec: Int = 0) {
         _state.update {
             it.copy(
                 isScreenOn = isScreenOn,
-                dynamicKeepaliveSec = 0
+                dynamicKeepaliveSec = if (isScreenOn) keepaliveSec else 0
             )
         }
     }

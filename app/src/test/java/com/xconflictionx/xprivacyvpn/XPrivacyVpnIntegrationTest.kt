@@ -401,6 +401,35 @@ class XPrivacyVpnIntegrationTest {
     }
 
     @Test
+    fun `wireguard session accepts delayed handshake response after retry initiation`() {
+        val (initPriv, initPub) = WireGuardCrypto.generateX25519KeyPair()
+        val (respPriv, respPub) = WireGuardCrypto.generateX25519KeyPair()
+
+        val config = WireGuardConfig(
+            privateKeyBase64 = Base64.getEncoder().encodeToString(initPriv),
+            addresses = emptyList(),
+            dnsServers = listOf("1.1.1.1"),
+            mtu = 1420,
+            peerPublicKeyBase64 = Base64.getEncoder().encodeToString(respPub),
+            allowedIps = emptyList(),
+            endpointHost = "198.51.100.1",
+            endpointPort = 2408
+        )
+
+        val session = WireGuardSession(config)
+        val firstInit = session.createHandshakeInitiation()
+        // A retry fires before the first response arrives
+        val secondInit = session.createHandshakeInitiation()
+        assertEquals(148, secondInit.size)
+
+        // First initiation's delayed Type 2 response arrives and must still establish the session
+        val firstResponse = simulateResponderHandshake(firstInit, respPriv, respPub, initPub)
+        assertNotNull(firstResponse)
+        assertTrue(session.processHandshakeResponse(firstResponse!!))
+        assertTrue(session.isEstablished)
+    }
+
+    @Test
     fun `firewall expands gemini playstore and google to complete companion bypass sets`() {
         val sampleInstalled = listOf(
             InstalledAppInfo(
