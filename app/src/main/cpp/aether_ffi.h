@@ -6,6 +6,7 @@
 extern "C" {
 #endif
 
+void aether_set_android_socket_protector(int (*callback)(int));
 char *aether_version(void);
 void aether_string_free(char *raw);
 char *aether_job_poll(uint64_t id);
