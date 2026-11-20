@@ -46,7 +46,7 @@ Before enabling the Aether tunnel under the Android VPN service, we must add a t
 
 ## Implementation sequence
 
-1. Build Aether and Quiche for the Android ABIs supported by xPrivacyVPN; package the native libraries through the Android Gradle/NDK build.
+1. Build Aether and Quiche for the Android ABIs supported by xPrivacyVPN with `scripts/build-aether-android.ps1`; it refuses to run outside `feature/cloudflare-one-masque` and writes the native libraries to `app/src/main/jniLibs`. Package them through Android Gradle.
 2. Add a Kotlin/JNI bridge for Aether's JSON C ABI, asynchronous job polling/cancellation, identity lifecycle, and team email-code authentication.
 3. Add the Android `VpnService.protect(fd)` callback to Aether's outbound socket creation path, tracked as an explicit upstream integration patch.
 4. Implement the TUN-to-SOCKS adapter after `PacketInspector`, preserving current DNS handling, filtering, logging, app selection, and firewall behavior.
