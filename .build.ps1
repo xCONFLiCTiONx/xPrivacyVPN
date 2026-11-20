@@ -55,31 +55,40 @@ $apkSizeMb = [Math]::Round((Get-Item $ApkPath).Length / 1MB, 2)
 Write-Host "==> $BuildVariant APK built successfully ($apkSizeMb MB): $ApkPath" -ForegroundColor Green
 
 # 3. Locate adb.exe
+$AdbPath = $null
 $adbCmd = Get-Command adb -ErrorAction SilentlyContinue
 if ($adbCmd) {
     $AdbPath = $adbCmd.Source
 } else {
-    $sdkAdb = Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe"
+    $Sdk = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } elseif ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { Join-Path $env:LOCALAPPDATA "Android\Sdk" }
+    $sdkAdb = Join-Path $Sdk "platform-tools\adb.exe"
     if (Test-Path $sdkAdb) {
         $AdbPath = $sdkAdb
-    } else {
-        throw "Could not find adb.exe in PATH or $sdkAdb"
     }
+}
+
+if (-not $AdbPath) {
+    Write-Host "==> adb.exe not found in PATH or Android SDK. Build succeeded; skipping install and launch." -ForegroundColor Yellow
+    exit 0
 }
 
 # 4. Verify connected Android device
 Write-Host "==> Checking connected Android device(s)..." -ForegroundColor Cyan
 $devicesOutput = & $AdbPath devices
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "==> Could not query ADB devices. Build succeeded; skipping install and launch." -ForegroundColor Yellow
+    exit 0
+}
 $unauthorizedDevices = $devicesOutput | Select-Object -Skip 1 | Where-Object { $_ -match "\S+\s+unauthorized\s*$" }
 $connectedDevices = $devicesOutput | Select-Object -Skip 1 | Where-Object { $_ -match "\S+\s+device\s*$" }
 
 if (-not $connectedDevices) {
-    Write-Host ($devicesOutput | Out-String) -ForegroundColor Yellow
     if ($unauthorizedDevices) {
-        throw "Your phone is connected but 'unauthorized'. Unlock your phone, tap 'Allow' on the 'Allow USB debugging?' prompt, and re-run this script."
+        Write-Host "==> Device connected but unauthorized. Approve USB debugging to install. Build succeeded; skipping install and launch." -ForegroundColor Yellow
     } else {
-        throw "No authorized Android device detected over ADB. Connect your phone with USB/Wireless debugging enabled."
+        Write-Host "==> No Android device attached over ADB. Build succeeded; skipping install and launch." -ForegroundColor Yellow
     }
+    exit 0
 }
 
 # 5. Dynamically determine Package Name from APK Manifest or Gradle files
