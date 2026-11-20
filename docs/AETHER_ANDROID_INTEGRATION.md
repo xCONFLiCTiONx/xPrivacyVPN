@@ -52,13 +52,13 @@ Before enabling the Aether tunnel under the Android VPN service, we must add a t
 4. Implement the TUN-to-SOCKS adapter after `PacketInspector`, preserving current DNS handling, filtering, logging, app selection, and firewall behavior.
 5. Keep the existing WireGuard transport selectable until Aether MASQUE passes device-level connection, traffic, reconnect, sleep/wake, IPv4/IPv6, DNS, and leak tests.
 
-The native build, JNI compilation, and device execution have **not** been run in this remote repository-editing session. The Kotlin facade intentionally does not load or start Aether until a caller invokes it, and it does not imply that socket protection or packet forwarding is implemented.
+The native build, JNI compilation, and device execution have **not** been run in this remote repository-editing session. The Kotlin facade now includes `awaitJob()` to poll asynchronous FFI jobs, unwrap the completed JSON result, surface native errors, cancel on timeout, and release job handles in `finally`. It does not imply that socket protection or packet forwarding is implemented.
 
 ## Current test status
 
 - Git submodule pointer: committed and pinned.
 - Aether native Android build: script and Gradle/CMake wiring committed; not run.
-- Kotlin/JNI bridge: source committed; not compiled or device-tested.
+- Kotlin/JNI bridge: source committed, including asynchronous job lifecycle helper; not compiled or device-tested.
 - Socket protection callback: not implemented.
 - TUN-to-SOCKS adapter: not implemented.
 - End-to-end Cloudflare test: not run.
