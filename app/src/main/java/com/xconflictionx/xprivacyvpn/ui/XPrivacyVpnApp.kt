@@ -1,5 +1,7 @@
 package com.xconflictionx.xprivacyvpn.ui
 
+import android.content.pm.PackageManager
+import android.os.Build
 import android.util.LruCache
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.Image
@@ -90,6 +92,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -1562,6 +1565,32 @@ private fun SettingsScreen(
                 }
             }
         }
+
+        val context = LocalContext.current
+        val versionName = remember(context) {
+            runCatching {
+                val pkgInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    context.packageManager.getPackageInfo(
+                        context.packageName,
+                        PackageManager.PackageInfoFlags.of(0)
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    context.packageManager.getPackageInfo(context.packageName, 0)
+                }
+                pkgInfo.versionName ?: "Unknown"
+            }.getOrDefault("Unknown")
+        }
+
+        Text(
+            text = "Version $versionName",
+            fontSize = 12.sp,
+            color = Color(0xFF64748B),
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 4.dp, bottom = 12.dp)
+        )
     }
 }
 
