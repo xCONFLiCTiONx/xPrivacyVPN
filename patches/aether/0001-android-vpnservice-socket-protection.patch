@@ -1,7 +1,7 @@
 diff --git a/aether/src/egress.rs b/aether/src/egress.rs
 --- a/aether/src/egress.rs
 +++ b/aether/src/egress.rs
-@@ -3,7 +3,8 @@
+@@ -3,7 +3,9 @@
  use std::io;
  use std::net::SocketAddr;
 -use std::sync::atomic::{AtomicU32, Ordering};
