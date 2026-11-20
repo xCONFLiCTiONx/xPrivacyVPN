@@ -83,3 +83,11 @@ The Kotlin side must pass the active XPrivacyVpnService instance to a JNI regist
 ## Job cancellation correction
 
 AetherNative.awaitJob() now cancels the native job on every unsuccessful exit path, including coroutine cancellation, timeout, malformed poll responses, and native polling errors, before releasing the job handle. A completed job is only freed. This prevents a canceled Kotlin caller from leaving a Rust worker running in the background.
+
+## Implemented Android socket-protection bridge
+
+The feature branch now contains an upstream-source patch at patches/aether/0001-android-vpnservice-socket-protection.patch. The Android build script applies it to the pinned Aether submodule before compiling. The patch adds a fail-closed socket callback to Aether egress and exports aether_set_android_socket_protector through the C ABI.
+
+The JNI bridge registers a global reference to the active VpnService, attaches Aether worker threads to the JVM when necessary, invokes VpnService.protect(fd), and returns failure to Rust if protection fails or throws. Kotlin exposes registerSocketProtector(service) and unregisterSocketProtector(). Registration must occur before any Aether scan, verification, or tunnel operation; unregister only after Aether jobs and sockets have stopped.
+
+This bridge is implemented but not yet device-validated. Aether's current tunnel API exposes a SOCKS listener rather than a raw TUN packet channel. The existing xPrivacyVPN WireGuard service has not been switched to Aether, and the TUN-to-SOCKS adapter remains separate work. Do not register/unregister while native jobs are still opening sockets.
