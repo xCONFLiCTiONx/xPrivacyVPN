@@ -12,7 +12,7 @@ diff --git a/aether/src/egress.rs b/aether/src/egress.rs
  
  use futures::stream::{FuturesUnordered, StreamExt};
  use socket2::{Domain, Protocol, SockRef, Socket, Type};
-@@ -18,6 +19,15 @@ pub enum EgressError {
+@@ -18,6 +19,13 @@ pub enum EgressError {
  }
  
  static MARK: AtomicU32 = AtomicU32::new(0);
@@ -26,7 +26,7 @@ diff --git a/aether/src/egress.rs b/aether/src/egress.rs
  
  pub(crate) const MAX_TRANSIENT_RECV_ERRORS: u32 = 64;
  pub(crate) const TRANSIENT_RECV_BACKOFF: Duration = Duration::from_millis(50);
-@@ -75,6 +85,21 @@ pub fn mark() -> u32 {
+@@ -75,6 +85,19 @@ pub fn mark() -> u32 {
  }
  
  pub fn apply(socket: SockRef<'_>) -> io::Result<()> {
@@ -53,14 +53,14 @@ diff --git a/aether/src/ffi.rs b/aether/src/ffi.rs
  #![allow(clippy::missing_safety_doc)]
  
  use std::collections::HashMap;
-@@ -17,6 +17,7 @@
+@@ -17,5 +17,6 @@
  use crate::account::Identity;
  use crate::api;
 +use crate::egress::{self, AndroidSocketProtector};
  use crate::zerotrust;
  
  type Reply = std::result::Result<Value, String>;
-@@ -100,6 +101,13 @@
+@@ -100,3 +101,8 @@
  }
  
 +#[no_mangle]
@@ -81,7 +81,7 @@ diff --git a/aether/src/prober.rs b/aether/src/prober.rs
          sock.connect(peer).await.ok()?;
          let local = sock.local_addr().ok()?;
  
-@@ -1221,7 +1221,7 @@
+@@ -1221,6 +1221,6 @@
      async fn tcp_answers(peer: SocketAddr, timeout: Duration) -> Option<Duration> {
          let started = Instant::now();
 -        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(peer)).await {
