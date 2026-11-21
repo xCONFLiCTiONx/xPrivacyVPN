@@ -1,101 +1,175 @@
 # xPrivacyVPN
 
-**xPrivacyVPN** is a lightweight, high-performance Android VPN client designed for **Cloudflare Zero Trust (WARP / WireGuard)** with an integrated multi-source **`filters.txt` Ad & Tracker Blocker** and **Zero Trust Location DNS** resolver—all operating together inside a single Android `VpnService`.
+**xPrivacyVPN is an Android-first privacy and Cloudflare One client that brings authenticated Cloudflare Zero Trust connectivity, native MASQUE tunnelling, and on-device traffic filtering together inside one Android `VpnService`.**
+
+It is not a wrapper around the official Cloudflare One app, and it does not require WireGuard to carry the Cloudflare One connection. xPrivacyVPN integrates the open-source **Aether** networking core directly and connects it to Android's native VPN packet interface.
+
+The project combines three things that are usually separate:
+
+- **Authenticated Cloudflare connectivity** — Cloudflare Zero Trust device enrollment and MASQUE CONNECT-IP.
+- **A real Android VPN and packet pipeline** — Android `VpnService`, per-app routing, packet inspection, and transport lifecycle management.
+- **Built-in privacy controls** — DNS filtering, remote and local filter lists, TLS SNI / HTTP host-path inspection, and activity telemetry.
+
+> **Maintainer field test:** Successful Cloudflare Zero Trust authentication/device enrollment and a persistent Cloudflare MASQUE connection have been verified on a physical Android phone. Compatibility across other devices, Android versions, and network environments continues to be tested.
 
 ---
+
+## Why this project is different
+
+Most Android VPN clients focus on carrying packets through a tunnel. xPrivacyVPN also owns the packet-processing and privacy layer around that tunnel.
+
+Cloudflare One authentication, device identity, and MASQUE transport are integrated into the app rather than delegated to a separate WireGuard profile or the official Cloudflare client. The same Android VPN service remains in control of app routing, DNS interception, filtering, packet inspection, and connection state.
+
+The Cloudflare transport is **MASQUE CONNECT-IP**, carried over HTTP/3 (QUIC) by default, with an HTTP/2 option. WireGuard remains available as a separate selectable transport; it is not a prerequisite for Cloudflare MASQUE.
 
 ## Features
 
-- **Cloudflare Zero Trust WireGuard Tunnel (per-app allowlist)**:
-  - Import or paste any standard WireGuard `.conf` profile (`[Interface]` and `[Peer]`).
-  - Full `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` handshake, transport encryption, and persistent keepalive engine.
-  - No bundled private key or default profile. Import your own WireGuard configuration; credentials remain in private app storage.
-- **Zero Trust DNS Location & System DNS Fallback**:
-  - **System DNS by Default**: Uses the device's underlying physical network System DNS out of the box until custom Location endpoints are configured.
-  - **Zero Trust Location Endpoints**: Dedicated configuration for your Cloudflare Zero Trust DNS Location:
-    - **IPv4 Primary & Secondary Endpoints** + optional **Source IPv4 Address**
-    - **IPv6 Endpoint**
-    - **DNS-over-TLS (DoT)** Endpoint (`tls://<gateway-id>.cloudflare-gateway.com:853`)
-    - **DNS-over-HTTPS (DoH)** Endpoint (`https://<gateway-id>.cloudflare-gateway.com/dns-query`, RFC 8484 wire-format)
-  - WireGuard transport and upstream DNS sockets are protected from routing loops. xPrivacyVPN itself is always included in the app allowlist so its remote filter downloads can reach xServer.
-- **Multi-Source `filters.txt` Engine**:
-  - Add **unlimited remote `filters.txt` URLs** (paste one or multiple URLs at once, with automatic GitLab/GitHub raw URL normalization) or import **local `filters.txt` files**.
-  - Supports Adblock Plus / uBlock / AdGuard domain rules (`||example.com^`), exception rules (`@@||example.com^`), domain + path rules (`||example.com/path^`), wildcard script/path rules (`*/ads.js`, `*/analytics.js`), and hosts-file rules (`0.0.0.0 example.com`).
-  - Toggle, refresh, or remove individual filter lists at any time.
-- **Deep Packet Inspection (DPI) & Real-Time Activity Log**:
-  - **DNS Interception (UDP Port 53)**: Blocks matching domains before queries leave the device (`0.0.0.0` / `::` or `NXDOMAIN` synthetic replies) and resolves allowed queries via your configured Zero Trust Location DNS or System DNS.
-  - **TLS SNI Inspection (TCP Port 443)** & **HTTP Path Inspection (TCP Port 80)**: Inspects outbound TLS ClientHello SNI and HTTP `Host` + request paths against active filter rules.
-  - Live telemetry dashboard and real-time packet log with filtering for **All**, **Blocked**, and **Allowed** events.
-- **Per-App Routing & Battery-Aware Recovery**:\n  - All apps bypass the VPN by default. xPrivacyVPN itself remains included so it can fetch remote filter lists; users explicitly select any additional apps to tunnel.\n  - No permanent partial wakelock or forced 25-second keepalive. Keepalives are sent only when requested by the imported profile; recovery checks use adaptive intervals.\n- **Android System & Reliability Optimizations**:
-  - Built-in shortcuts in **Settings** to disable Android Battery Optimizations (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) and grant Notification permissions.
-  - Compiled with R8 code shrinking, obfuscation, and resource optimization enabled for Release builds.
+### Cloudflare One / Zero Trust
+
+- Cloudflare Zero Trust team enrollment and managed-device identity.
+- Cloudflare device identity and MASQUE certificate persistence across app restarts.
+- Cloudflare MASQUE CONNECT-IP raw-IP tunnel using the Aether Rust core.
+- HTTP/3 over QUIC, with configurable HTTP/2 transport.
+- Cloudflare gateway selection with prioritized endpoint checks and fallback scanning.
+- Android `VpnService.protect(fd)` integration for Aether's outbound sockets, preventing the tunnel's own sockets from looping back into its TUN interface.
+- Fail-closed socket protection and tunnel lifecycle handling.
+- Persistent enrolled identity metadata so a temporary reconnect or endpoint failure does not unnecessarily discard enrollment.
+- Network migration support exposed by the native transport.
+- No root required.
+
+### Android VPN and routing
+
+- Native Android `VpnService` TUN interface.
+- Per-app routing / firewall selection.
+- Separate transport boundary for Cloudflare MASQUE and WireGuard.
+- Tunnel lifecycle states distinguish authentication, enrollment, connection, reconnection, and failure.
+- WireGuard remains available as an independent transport option.
+
+### xPrivacy Guard filtering
+
+- Multiple remote `filters.txt` sources and local filter-file imports.
+- Adblock Plus / uBlock / AdGuard-style domain rules, exceptions, domain-and-path rules, wildcard rules, and hosts-file entries.
+- DNS interception and filtering before queries are forwarded.
+- TLS ClientHello SNI inspection and HTTP Host/request-path inspection.
+- Real-time activity telemetry for allowed and blocked traffic.
+- Filtering and packet inspection remain in the Android VPN pipeline regardless of the selected tunnel transport.
+
+### DNS and privacy
+
+- System DNS fallback when custom DNS configuration is not supplied.
+- Cloudflare Zero Trust DNS Location configuration, including supported IPv4, IPv6, DoT, and DoH endpoints.
+- DNS requests are inspected against active filter lists before upstream resolution.
+- Private DNS / private-domain routing options are available in the DNS configuration.
+
+### Android reliability
+
+- Foreground VPN service and connection-state reporting.
+- Persisted settings and Cloudflare enrollment metadata.
+- Adaptive recovery behavior rather than an unconditional permanent partial wakelock.
+- Release builds use R8 code shrinking, obfuscation, and resource optimization.
 
 ---
 
-## Project Architecture
+## Architecture
+
+The Android app owns the VPN interface and privacy pipeline. Aether supplies the Cloudflare networking core; a small JNI bridge exposes the native functions to Kotlin.
 
 ```text
-app/src/main/java/com/xconflictionx/xprivacyvpn/
-├── MainActivity.kt                  # Compose entry point
-├── config/
-│   └── WireGuardConfig.kt           # WireGuard .conf parser & validator
-├── dns/
-│   ├── ZeroTrustDnsConfig.kt        # Zero Trust Location DNS configuration model
-│   └── ZeroTrustDnsResolver.kt      # DoH (RFC 8484), DoT (RFC 7858), IPv4/IPv6 UDP & System DNS resolver
-├── filter/
-│   ├── FilterEngine.kt              # Multi-source filters.txt parser & matcher (domain, subdomain, path, wildcard)
-│   └── FilterSourceRepository.kt    # Remote URL & local file persistence and downloader
-├── packet/
-│   └── PacketInspector.kt           # IPv4/IPv6 UDP DNS, TLS SNI, and HTTP packet inspector & reply synthesizer
-├── ui/
-│   ├── MainViewModel.kt             # UI state holder & actions
-│   ├── XPrivacyVpnApp.kt            # Material 3 Dark UI (Dashboard, Filter Lists, WG & DNS, Activity, Settings)
-│   └── theme/                       # Material 3 theme & colors
-├── vpn/
-│   ├── VpnStateManager.kt           # Reactive state, statistics, and SharedPreferences persistence
-│   └── XPrivacyVpnService.kt        # Foreground Android VpnService (TUN loop + DNS + WireGuard session)
-└── wireguard/
-    ├── WireGuardCrypto.kt           # X25519, ChaCha20-Poly1305, BLAKE2s, HKDF primitives
-    └── WireGuardSession.kt          # Noise_IKpsk2 handshake & transport packet encryption
+app/src/main/
+├── java/com/xconflictionx/xprivacyvpn/
+│   ├── config/                 # WireGuard and Cloudflare One configuration
+│   ├── dns/                    # DNS configuration and resolution
+│   ├── filter/                 # Filter-list parsing, storage, and matching
+│   ├── packet/                 # DNS, TLS SNI, HTTP inspection and packet handling
+│   ├── ui/                     # Compose UI and application state
+│   ├── vpn/                    # Android VpnService and VPN state management
+│   └── wireguard/              # WireGuard transport implementation
+└── cpp/
+    ├── aether_ffi.h            # Pinned Aether C ABI declarations
+    ├── aether_jni.cpp          # JNI bridge and Android socket protection callback
+    └── CMakeLists.txt
+
+third_party/Aether/             # Upstream Aether Git submodule (pinned revision)
+patches/aether/                  # Explicit, reproducible Android integration patches
+scripts/build-aether-android.ps1 # Native Aether Android build
 ```
 
+### Aether integration
+
+xPrivacyVPN uses **[Aether](https://github.com/CluvexStudio/Aether)** as a Git submodule, pinned to a specific upstream revision. Aether is a Rust-based networking core that supports MASQUE and WireGuard and is also used by the cross-platform [Oblivion](https://github.com/bepass-org/oblivion) WARP client.
+
+xPrivacyVPN does **not** embed the Oblivion Android application. It integrates Aether directly into its own Android VPN service and UI.
+
+Two explicit Android integration patches are maintained in this repository:
+
+1. **Android socket protection:** exposes a native callback that calls Android's `VpnService.protect(fd)` for Aether-created outbound sockets. It fails closed if protection is missing or rejected.
+2. **Raw-IP MASQUE FFI:** exposes Aether's MASQUE CONNECT-IP packet channels through a small C ABI so Android's TUN packet pipeline can exchange complete IP packets directly, without routing through a desktop SOCKS5 proxy adapter.
+
+The build script applies these patches to the checked-out Aether submodule before compiling it. The upstream Aether repository is not silently rewritten; the integration changes are visible and reviewable in `patches/aether/`.
+
 ---
 
-## Prerequisites
+## Requirements
 
-- **Android Studio** (or Android SDK + JDK 17 / JBR 21+)
-- **Android Device or Emulator** running Android 8.0+ (API 26+) with **USB Debugging (ADB)** enabled
-- **PowerShell** (for automated one-command release build, install, and launch via `.build.ps1`)
+- Android device or emulator running Android 8.0+ (API 26+).
+- Android SDK and Android NDK.
+- JDK 17.
+- Rust stable toolchain and the Android Rust targets being built.
+- `cargo-ndk` for building Aether's native Android libraries.
+- PowerShell 5.1+ for the supplied Windows build scripts.
 
----
+The current native build targets are `arm64-v8a` and `x86_64`.
 
-## Build, Install & Run
+## Build, install, and run
 
-### Automated Build & Deploy (`.build.ps1`)
-
-Connect your Android phone via USB with USB Debugging enabled and run:
+Clone the repository with its Aether submodule:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\.build.ps1
+git clone --recurse-submodules https://github.com/xCONFLiCTiONx/xPrivacyVPN.git
+cd xPrivacyVPN
 ```
 
-What `.build.ps1` does:
-1. Locates your JDK (`JAVA_HOME` or Android Studio JBR) and Android `adb`.
-2. Builds the R8-optimized **Release APK** (`.\gradlew.bat assembleRelease`).
-3. Installs the selected APK onto your connected device via `adb install -r`. It never uninstalls the existing app or deletes its data when signatures differ.
-4. Launches `com.xconflictionx.xprivacyvpn/.MainActivity` on your phone.
+If the repository was cloned without submodules:
 
-**Optional flags**:
-- Build the Release APK only (skip ADB install):
-  ```powershell
-  .\.build.ps1 -SkipInstall
-  ```
-- Target a specific ADB device serial:
-  ```powershell
-  .\.build.ps1 -DeviceSerial <SERIAL>
-  ```
+```powershell
+git submodule update --init --recursive
+```
 
-### Running Unit Tests
+### 1. Build Aether's Android native libraries
+
+Install the Rust Android targets and `cargo-ndk` if they are not already installed:
+
+```powershell
+rustup target add aarch64-linux-android
+rustup target add x86_64-linux-android
+cargo install cargo-ndk
+```
+
+Set `ANDROID_NDK_HOME` (or another supported Android NDK environment variable), then run:
+
+```powershell
+.\scripts\build-aether-android.ps1
+```
+
+This builds the pinned Aether library for the selected Android ABIs and places the resulting libraries under `app/src/main/jniLibs`. It also applies the tracked Android integration patches to the local submodule checkout.
+
+### 2. Build and install the Release APK
+
+Connect an Android device with USB debugging enabled, then run:
+
+```powershell
+.\.build.ps1
+```
+
+The script builds the optimized Release APK, installs it with `adb install -r`, and launches the app when a device is available. It does not uninstall the existing app or erase its data if the signing key differs.
+
+Build without installing:
+
+```powershell
+.\.build.ps1 -SkipInstall
+```
+
+### 3. Run unit tests
 
 ```powershell
 .\gradlew.bat testDebugUnitTest
@@ -103,29 +177,52 @@ What `.build.ps1` does:
 
 ---
 
-## Usage Guide
+## Usage
 
-1. **Import Your WireGuard Config (`WG & DNS` Tab)**:
-   - Open the **WG & DNS** tab and tap **Import .conf File** (or paste your `[Interface]` / `[Peer]` configuration and tap **Save Config**).
-2. **Configure DNS (`WG & DNS` Tab)**:
-   - Normal DNS uses the `DNS =` servers from the imported WireGuard `[Interface]` section. DNS requests are filtered before being forwarded through the WireGuard tunnel.
-   - For private home names, enter the private DNS suffix (for example, `home.example.com`) and the IP address of the DNS server reachable over the tunnel, then tap **Save DNS**.
-   - Private-domain queries are sent only to that private DNS server. If it cannot be reached, xPrivacyVPN returns SERVFAIL rather than leaking the name to public DNS.
-   - The WireGuard `[Peer]` `AllowedIPs` must include the private DNS server's network. A full-tunnel `0.0.0.0/0` route already includes IPv4 destinations.
-   - Leave both private DNS fields blank if you do not use private hostnames.
-3. **Add `filters.txt` Lists (`Filter Lists` Tab)**:
-   - Paste one or more `filters.txt` URLs (one per line) and tap **Fetch & Add URL(s)**, or tap **Import Local filters.txt** to pick a file from your device.
-4. **Optimize System Settings (`Settings` Tab)**:
-   - Tap **Disable Battery Optimization** to set the app to *Unrestricted* so Android does not suspend the VPN tunnel.
-   - Optionally toggle **Auto-Connect on Phone Boot / Update** if you want the tunnel to start when your phone boots.
-5. **Connect (`Dashboard` Tab)**:
-   - Open **Firewall** and enable the apps you want to route through the tunnel. All other apps use normal internet; xPrivacyVPN itself remains included for remote filter downloads.\n  - Tap the central power button to start the WireGuard + `filters.txt` tunnel.
+1. Open the **Tunnel** configuration and select **Cloudflare One (MASQUE)** as the active transport.
+2. Configure the Cloudflare Zero Trust team and complete the supported authentication/enrollment flow.
+3. Allow Android to create the VPN connection when prompted.
+4. Connect from the dashboard. The app opens or restores its enrolled Aether device identity, verifies/selects a reachable Cloudflare MASQUE endpoint, and establishes the CONNECT-IP tunnel.
+5. Configure per-app routing, DNS, and filter lists as needed.
+
+WireGuard remains selectable for users who want to import and use a WireGuard profile instead.
 
 ---
 
-## Privacy & Security
+## Security and privacy
 
-- **No hardcoded credentials**: WireGuard private keys, profiles, signing keys, and Zero Trust Location addresses must never be committed. Release signing material is supplied locally through `XPRIVACYVPN_KEYSTORE_PATH`, `XPRIVACYVPN_KEYSTORE_PASSWORD`, `XPRIVACYVPN_KEY_ALIAS`, and `XPRIVACYVPN_KEY_PASSWORD`; it is not part of this repository.
-- All user-supplied configurations are stored locally in the app's private storage on your device.
+- No default Cloudflare account, device identity, or private WireGuard key is bundled.
+- Cloudflare enrollment material and user configuration are stored in the app's private storage.
+- Aether's outbound sockets must be protected with Android's `VpnService.protect(fd)` before network operations begin; failure to protect a socket aborts the operation.
+- Tunnel authentication/enrollment is distinct from tunnel connectivity. The app should not report a connected tunnel until the authenticated transport is established.
+- Do not commit access tokens, service-token secrets, private keys, signing credentials, or personal enrollment data.
+- xPrivacyVPN's packet inspection and filtering remain in the Android VPN service rather than being delegated to an external proxy.
 
 ---
+
+## Upstream projects and acknowledgements
+
+This project builds on the work of the maintainers of these upstream projects:
+
+- **[Aether](https://github.com/CluvexStudio/Aether)** — Rust networking core providing MASQUE, WireGuard, and Cloudflare Zero Trust enrollment functionality. Aether is included as a pinned Git submodule.
+- **[Oblivion](https://github.com/bepass-org/oblivion)** — cross-platform unofficial Cloudflare WARP client that also integrates Aether. xPrivacyVPN integrates Aether directly; it does not embed the Oblivion app.
+- **[Cloudflare quiche](https://github.com/cloudflare/quiche)** — QUIC and HTTP/3 implementation used by Aether.
+- **[BoringTun](https://github.com/cloudflare/boringtun)** and other dependencies — see their upstream notices and the corresponding dependency manifests.
+
+All upstream license files, copyright notices, and third-party terms must remain intact. The Aether submodule retains its upstream **GNU AGPL v3** license; xPrivacyVPN's own project license does not replace the license of that separately maintained component.
+
+---
+
+## Project status
+
+Cloudflare Zero Trust enrollment and a persistent MASQUE connection have been successfully exercised by the maintainer on a physical Android phone. This is an important working milestone, but it is not a claim of universal compatibility or a completed independent security audit.
+
+Testing still needs to cover a wider range of Android devices and versions, Wi-Fi and cellular transitions, sleep/wake, IPv4 and IPv6 behavior, DNS leak resistance, packet loss, reconnect behavior, and sustained throughput under load.
+
+Bug reports, reproducible test results, and thoughtful contributions are welcome.
+
+## License
+
+xPrivacyVPN is licensed under the **GNU General Public License v3.0**. See [LICENSE](LICENSE).
+
+Third-party components retain their own licenses and notices. In particular, the Aether submodule is licensed under the **GNU Affero General Public License v3.0**. See the upstream [Aether LICENSE](https://github.com/CluvexStudio/Aether/blob/main/LICENSE) and the relevant third-party license files before redistributing builds.
