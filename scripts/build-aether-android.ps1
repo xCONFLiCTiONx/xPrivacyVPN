@@ -9,13 +9,13 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
-$ExpectedBranch = "feature/cloudflare-one-masque"
+$AllowedBranches = @("main", "feature/cloudflare-one-masque")
 $CurrentBranch = (git branch --show-current).Trim()
 if ($LASTEXITCODE -ne 0) {
     throw "Unable to read the current Git branch."
 }
-if ($CurrentBranch -ne $ExpectedBranch) {
-    throw "Refusing to build Aether outside '$ExpectedBranch'. Current branch: '$CurrentBranch'."
+if ($AllowedBranches -notcontains $CurrentBranch) {
+    throw "Refusing to build Aether on branch '$CurrentBranch'. Allowed: $($AllowedBranches -join ', ')."
 }
 
 $AetherPath = Join-Path $RepoRoot "third_party/Aether"
