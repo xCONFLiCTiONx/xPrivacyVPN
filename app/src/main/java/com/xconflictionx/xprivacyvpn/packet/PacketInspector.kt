@@ -36,44 +36,6 @@ object PacketInspector {
     private const val PROTO_TCP = 6
     private const val PROTO_UDP = 17
 
-    // Well-known public DoH resolver IPs that Android's DnsResolver (opportunistic Private DNS)
-    // auto-upgrades to DoH over QUIC/UDP:443 or HTTPS/TCP:443, bypassing TUN UDP:53 inspection.
-    private val KNOWN_DOH_IPV4: List<ByteArray> = listOf(
-        byteArrayOf(1, 1, 1, 1),
-        byteArrayOf(1, 0, 0, 1),
-        byteArrayOf(8, 8, 8, 8),
-        byteArrayOf(8, 8, 4, 4),
-        byteArrayOf(9, 9, 9, 9),
-        byteArrayOf(149.toByte(), 112, 112, 112)
-    )
-
-    private val KNOWN_DOH_IPV6: List<ByteArray> = listOf(
-        "2606:4700:4700::1111",
-        "2606:4700:4700::1001",
-        "2001:4860:4860::8888",
-        "2001:4860:4860::8844",
-        "2620:fe::fe",
-        "2620:fe::9"
-    ).mapNotNull { runCatching { java.net.InetAddress.getByName(it).address }.getOrNull() }
-
-    private fun isKnownPublicDohIp(packet: ByteArray, version: Int): Boolean {
-        val offset = if (version == 4) 16 else 24
-        val size = if (version == 4) 4 else 16
-        if (packet.size < offset + size) return false
-        val targets = if (version == 4) KNOWN_DOH_IPV4 else KNOWN_DOH_IPV6
-        for (target in targets) {
-            var match = true
-            for (i in 0 until size) {
-                if (packet[offset + i] != target[i]) {
-                    match = false
-                    break
-                }
-            }
-            if (match) return true
-        }
-        return false
-    }
-
     private fun isConfiguredDnsForwarder(packet: ByteArray, version: Int, sourcePort: Int, addresses: Set<String>, sourcePorts: Set<Int>): Boolean {
         if (addresses.isEmpty() || sourcePort !in sourcePorts) return false
         val offset = if (version == 4) 16 else 24
@@ -207,16 +169,6 @@ object PacketInspector {
             )
         }
 
-        if (protocol == PROTO_UDP && dstPort == 443 && isKnownPublicDohIp(packet, 4)) {
-            return PacketAction.DropAndReply(
-                replyPacket = ByteArray(0),
-                targetHost = "doh-udp:443",
-                protocol = "DoH",
-                decision = FilterDecision(blocked = true, matchedRule = "doh-downgrade", sourceName = "System"),
-                logEvent = false
-            )
-        }
-
         if (protocol == PROTO_UDP && dstPort == 53) {
             val udpHeaderLen = 8
             val dnsOffset = ihl + udpHeaderLen
@@ -265,21 +217,6 @@ object PacketInspector {
                 replyPacket = rst,
                 targetHost = "dot:853",
                 protocol = "DoT",
-                decision = decision,
-                logEvent = false
-            )
-        }
-
-        if (protocol == PROTO_TCP && dstPort == 443 && isKnownPublicDohIp(packet, 4)) {
-            if (length < ihl + 20) return PacketAction.ForwardToWireGuard
-            val tcpDataOffset = ((packet[ihl + 12].toInt() ushr 4) and 0x0F) * 4
-            val payloadLen = (length - (ihl + tcpDataOffset)).coerceAtLeast(0)
-            val rst = buildIpv4TcpReset(packet, ihl, payloadLen)
-            val decision = FilterDecision(blocked = true, matchedRule = "doh-downgrade", sourceName = "System")
-            return PacketAction.DropAndReply(
-                replyPacket = rst,
-                targetHost = "doh:443",
-                protocol = "DoH",
                 decision = decision,
                 logEvent = false
             )
@@ -364,16 +301,6 @@ object PacketInspector {
             )
         }
 
-        if (nextHeader == PROTO_UDP && dstPort == 443 && isKnownPublicDohIp(packet, 6)) {
-            return PacketAction.DropAndReply(
-                replyPacket = ByteArray(0),
-                targetHost = "doh-udp:443",
-                protocol = "DoHv6",
-                decision = FilterDecision(blocked = true, matchedRule = "doh-downgrade", sourceName = "System"),
-                logEvent = false
-            )
-        }
-
         if (nextHeader == PROTO_UDP && dstPort == 53) {
             val dnsOffset = ipv6HeaderLen + 8
             val dnsLen = length - dnsOffset
@@ -420,21 +347,6 @@ object PacketInspector {
                 replyPacket = rst,
                 targetHost = "dot:853",
                 protocol = "DoTv6",
-                decision = decision,
-                logEvent = false
-            )
-        }
-
-        if (nextHeader == PROTO_TCP && dstPort == 443 && isKnownPublicDohIp(packet, 6)) {
-            if (length < ipv6HeaderLen + 20) return PacketAction.ForwardToWireGuard
-            val tcpDataOffset = ((packet[ipv6HeaderLen + 12].toInt() ushr 4) and 0x0F) * 4
-            val payloadLen = (length - (ipv6HeaderLen + tcpDataOffset)).coerceAtLeast(0)
-            val rst = buildIpv6TcpReset(packet, payloadLen)
-            val decision = FilterDecision(blocked = true, matchedRule = "doh-downgrade", sourceName = "System")
-            return PacketAction.DropAndReply(
-                replyPacket = rst,
-                targetHost = "doh:443",
-                protocol = "DoHv6",
                 decision = decision,
                 logEvent = false
             )

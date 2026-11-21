@@ -320,6 +320,47 @@ class XPrivacyVpnIntegrationTest {
     }
 
     @Test
+    fun `packet inspector allows HTTPS and QUIC port 443 to 1_1_1_1 for one_one_one_one`() {
+        val engine = FilterEngine()
+        val udp443 = ByteArray(28).apply {
+            this[0] = 0x45.toByte()
+            this[2] = 0; this[3] = 28
+            this[8] = 64
+            this[9] = 17 // UDP
+            this[12] = 100; this[13] = 96; this[14] = 0; this[15] = 2
+            this[16] = 1; this[17] = 1; this[18] = 1; this[19] = 1
+            this[20] = (50000 ushr 8).toByte()
+            this[21] = (50000 and 0xFF).toByte()
+            this[22] = (443 ushr 8).toByte()
+            this[23] = (443 and 0xFF).toByte()
+            this[24] = 0; this[25] = 8
+        }
+        assertEquals(
+            PacketAction.ForwardToWireGuard,
+            PacketInspector.inspectOutboundPacket(udp443, udp443.size, engine)
+        )
+
+        val tcp443Syn = ByteArray(40).apply {
+            this[0] = 0x45.toByte()
+            this[2] = 0; this[3] = 40
+            this[8] = 64
+            this[9] = 6 // TCP
+            this[12] = 100; this[13] = 96; this[14] = 0; this[15] = 2
+            this[16] = 1; this[17] = 1; this[18] = 1; this[19] = 1
+            this[20] = (50001 ushr 8).toByte()
+            this[21] = (50001 and 0xFF).toByte()
+            this[22] = (443 ushr 8).toByte()
+            this[23] = (443 and 0xFF).toByte()
+            this[32] = 0x50.toByte()
+            this[33] = 0x02.toByte()
+        }
+        assertEquals(
+            PacketAction.ForwardToWireGuard,
+            PacketInspector.inspectOutboundPacket(tcp443Syn, tcp443Syn.size, engine)
+        )
+    }
+
+    @Test
     fun `private split DNS matches only the configured domain and its subdomains`() {
         val config = ZeroTrustDnsConfig(
             privateDomain = "home.example.com",
