@@ -42,12 +42,12 @@ data class TrafficLogEntry(
 data class VpnRuntimeState(
     val status: TunnelStatus = TunnelStatus.DISCONNECTED,
     val statusMessage: String = "Disconnected",
-    val activeTransport: TunnelProtocol = TunnelProtocol.WIREGUARD,
+    val activeTransport: TunnelProtocol = TunnelProtocol.CLOUDFLARE_MASQUE,
     val cloudflareOneConfig: CloudflareOneConfig = CloudflareOneConfig(),
     val handshakeEstablished: Boolean = false,
     val lastHandshakeMs: Long = 0L,
     val endpoint: String = "Not Configured",
-    val tunnelAddresses: String = "Import a .conf file in WG Conf tab",
+    val tunnelAddresses: String = "Sign in to Cloudflare One on Tunnel tab",
     val tunnelDns: String = "System DNS (Default)",
     val zeroTrustDns: ZeroTrustDnsConfig = ZeroTrustDnsConfig(),
     val rxBytes: Long = 0L,
@@ -276,9 +276,9 @@ object VpnStateManager {
 
     fun loadActiveTransport(context: Context): TunnelProtocol {
         val prefs = deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val raw = prefs.getString(KEY_ACTIVE_TRANSPORT, TunnelProtocol.WIREGUARD.name)
-        return runCatching { TunnelProtocol.valueOf(raw ?: TunnelProtocol.WIREGUARD.name) }
-            .getOrDefault(TunnelProtocol.WIREGUARD)
+        val raw = prefs.getString(KEY_ACTIVE_TRANSPORT, TunnelProtocol.CLOUDFLARE_MASQUE.name)
+        return runCatching { TunnelProtocol.valueOf(raw ?: TunnelProtocol.CLOUDFLARE_MASQUE.name) }
+            .getOrDefault(TunnelProtocol.CLOUDFLARE_MASQUE)
     }
 
     fun saveActiveTransport(context: Context, protocol: TunnelProtocol) {
@@ -523,6 +523,15 @@ object VpnStateManager {
     fun isAutoStartOnBootEnabled(context: Context): Boolean {
         val prefs = deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         return prefs.getBoolean(KEY_AUTO_START_BOOT, true)
+    }
+
+    fun hasConfiguredTunnel(context: Context): Boolean {
+        val transport = loadActiveTransport(context)
+        if (transport == TunnelProtocol.CLOUDFLARE_MASQUE) {
+            val cf = loadCloudflareOneConfig(context)
+            return cf.canConnect || hasPersistedAetherIdentity(context, cf)
+        }
+        return loadWireGuardConfText(context).isNotBlank()
     }
 
     fun updateFilterSources(sources: List<FilterSource>) {

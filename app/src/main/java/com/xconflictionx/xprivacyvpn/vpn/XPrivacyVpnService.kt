@@ -449,11 +449,12 @@ class XPrivacyVpnService : VpnService() {
                     currentPhysicalNetwork = network
                     runCatching { setUnderlyingNetworks(arrayOf(network)) }
                     // Only rebind when switching between two distinct physical networks, or if
-                    // we have no live socket yet. Avoid tearing down the initial socket during
-                    // startVpnTunnel() startup when oldNetwork transitions from null -> network.
+                    // we have no live socket / dead MASQUE tunnel. Avoid tearing down the initial
+                    // socket during startVpnTunnel() startup when oldNetwork transitions from null -> network.
                     val switchedNetworks = oldNetwork != null && oldNetwork != network
                     val missingSocket = udpSocket == null || udpSocket?.isClosed == true
-                    if (switchedNetworks || (activeWgSession != null && missingSocket)) {
+                    val deadAether = activeAetherTransport?.let { !it.isAlive() } == true
+                    if (switchedNetworks || (activeWgSession != null && missingSocket) || deadAether) {
                         onPhysicalNetworkChanged(network, forceSocketRecreate = true)
                     }
                 }
@@ -778,6 +779,7 @@ class XPrivacyVpnService : VpnService() {
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
+                if (!isActive) throw CancellationException("Tunnel replaced or stopped", e)
                 VpnStateManager.updateStatus(
                     status = TunnelStatus.CONNECTING,
                     message = "VPN Reconnecting: ${e.message ?: "Recovering..."}",
@@ -786,8 +788,6 @@ class XPrivacyVpnService : VpnService() {
                 delay(3000L)
                 if (isActive) {
                     startVpnTunnel()
-                } else {
-                    stopVpnTunnel(resetStatus = false)
                 }
             }
         }
@@ -814,7 +814,8 @@ class XPrivacyVpnService : VpnService() {
      */
     private fun startAetherMasqueTunnel() {
         tunnelJob = serviceScope.launch {
-            try {
+                var transport: AetherMasqueTransport? = null
+                try {
                 // Clean up any previous WireGuard or Aether transport cleanly first
                 runCatching { udpSocket?.close() }
                 udpSocket = null
@@ -842,7 +843,7 @@ class XPrivacyVpnService : VpnService() {
                 )
                 updateNotification("Connecting Cloudflare MASQUE...")
 
-                val transport = AetherMasqueTransport(
+                val createdTransport = AetherMasqueTransport(
                     vpnService = this@XPrivacyVpnService,
                     identityDir = VpnStateManager.aetherIdentityDir(applicationContext),
                     config = cfConfig,
@@ -866,10 +867,11 @@ class XPrivacyVpnService : VpnService() {
                         VpnStateManager.saveCloudflareOneConfig(applicationContext, enrolledCf)
                     }
                 )
-                activeAetherTransport = transport
+                transport = createdTransport
+                activeAetherTransport = createdTransport
 
-                transport.connect().getOrThrow()
-                val session = transport.sessionInfo
+                createdTransport.connect().getOrThrow()
+                val session = createdTransport.sessionInfo
                     ?: throw IllegalStateException("MASQUE session established without metadata")
 
                 // Persist updated Cloudflare identity / assigned addresses for reboot recovery
@@ -953,7 +955,7 @@ class XPrivacyVpnService : VpnService() {
                 aetherRxJob = serviceScope.launch(Dispatchers.IO) {
                     val rxBuf = ByteArray(65535)
                     while (isActive && !tunnelDied.get()) {
-                        val n = transport.receivePacketInto(rxBuf, timeoutMs = 250)
+                        val n = createdTransport.receivePacketInto(rxBuf, timeoutMs = 250)
                         if (n > 0) {
                             lastRxEpochMs.set(System.currentTimeMillis())
                             VpnStateManager.addRxBytes(n)
@@ -961,7 +963,26 @@ class XPrivacyVpnService : VpnService() {
                                 runCatching { tunOut.write(rxBuf, 0, n) }
                             }
                         } else if (n < 0) {
-                            tunnelDied.set(true)
+                            if (tunnelDied.compareAndSet(false, true) &&
+                                isActive &&
+                                activeAetherTransport === createdTransport &&
+                                VpnStateManager.state.value.activeTransport == TunnelProtocol.CLOUDFLARE_MASQUE
+                            ) {
+                                // Proactively reconnect even if uplink tunIn.read() is blocked idle
+                                serviceScope.launch {
+                                    VpnStateManager.updateStatus(
+                                        status = TunnelStatus.CONNECTING,
+                                        message = "MASQUE tunnel closed, reconnecting...",
+                                        handshakeEstablished = false
+                                    )
+                                    delay(1500L)
+                                    if (activeAetherTransport === createdTransport &&
+                                        VpnStateManager.state.value.activeTransport == TunnelProtocol.CLOUDFLARE_MASQUE
+                                    ) {
+                                        startVpnTunnel()
+                                    }
+                                }
+                            }
                             break
                         }
                     }
@@ -986,7 +1007,7 @@ class XPrivacyVpnService : VpnService() {
                         continue
                     }
 
-                    if (tunnelDied.get() || !transport.isAlive()) {
+                    if (tunnelDied.get() || !createdTransport.isAlive()) {
                         // Fail-closed: drop packet and trigger reconnect without releasing TUN
                         throw IllegalStateException("MASQUE tunnel disconnected")
                     }
@@ -1076,7 +1097,7 @@ class XPrivacyVpnService : VpnService() {
                                                     VpnStateManager.addRxBytes(ipUdpReply.size)
                                                 }
                                             } else {
-                                                val rc = transport.sendPacketFast(reqCopy, reqCopy.size)
+                                                val rc = createdTransport.sendPacketFast(reqCopy, reqCopy.size)
                                                 if (rc == 0) {
                                                     lastTxEpochMs.set(System.currentTimeMillis())
                                                     VpnStateManager.addTxBytes(reqCopy.size)
@@ -1086,7 +1107,7 @@ class XPrivacyVpnService : VpnService() {
                                     }
                                 }
                             } else {
-                                val rc = transport.sendPacketFast(tunBuf, readLen)
+                                val rc = createdTransport.sendPacketFast(tunBuf, readLen)
                                 if (rc == 0) {
                                     lastTxEpochMs.set(System.currentTimeMillis())
                                     VpnStateManager.addTxBytes(readLen)
@@ -1096,7 +1117,7 @@ class XPrivacyVpnService : VpnService() {
                             }
                         }
                         PacketAction.ForwardToWireGuard -> {
-                            val rc = transport.sendPacketFast(tunBuf, readLen)
+                            val rc = createdTransport.sendPacketFast(tunBuf, readLen)
                             if (rc == 0) {
                                 lastTxEpochMs.set(System.currentTimeMillis())
                                 VpnStateManager.addTxBytes(readLen)
@@ -1114,10 +1135,11 @@ class XPrivacyVpnService : VpnService() {
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                aetherRxJob?.cancel()
-                activeAetherTransport?.let { dead ->
+                if (!isActive) throw CancellationException("MASQUE tunnel replaced or stopped", e)
+                if (activeAetherTransport === transport) {
+                    aetherRxJob?.cancel()
                     activeAetherTransport = null
-                    runCatching { dead.disconnect() }
+                    transport?.let { dead -> runCatching { dead.disconnect() } }
                 }
                 VpnStateManager.updateStatus(
                     status = TunnelStatus.CONNECTING,
@@ -1127,8 +1149,6 @@ class XPrivacyVpnService : VpnService() {
                 delay(3000L)
                 if (isActive && VpnStateManager.state.value.activeTransport == TunnelProtocol.CLOUDFLARE_MASQUE) {
                     startVpnTunnel()
-                } else if (!isActive) {
-                    stopVpnTunnel(resetStatus = false)
                 }
             }
         }
@@ -1299,7 +1319,22 @@ class XPrivacyVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun warmSessionIfStale() {
+    private fun warmSessionIfStale(forceMigrateMasque: Boolean = false) {
+        if (appliedTransport == TunnelProtocol.CLOUDFLARE_MASQUE || activeAetherTransport != null) {
+            val aether = activeAetherTransport
+            if (aether == null || !aether.isAlive()) {
+                startVpnTunnel()
+                return
+            }
+            val rxAge = System.currentTimeMillis() - lastRxEpochMs.get()
+            if (forceMigrateMasque || rxAge > STALE_RX_REHANDSHAKE_MS) {
+                if (!aether.migrateNetwork()) {
+                    startVpnTunnel()
+                }
+            }
+            return
+        }
+
         val sock = udpSocket ?: return
         val peer = activePeerAddress ?: return
         val session = activeWgSession ?: return
@@ -1340,6 +1375,10 @@ class XPrivacyVpnService : VpnService() {
                             }
                             serviceScope.launch(Dispatchers.IO) {
                                 warmSessionIfStale()
+                            }
+                        } else if (appliedTransport == TunnelProtocol.CLOUDFLARE_MASQUE || activeAetherTransport != null) {
+                            serviceScope.launch(Dispatchers.IO) {
+                                warmSessionIfStale(forceMigrateMasque = wasScreenOff)
                             }
                         }
                     }

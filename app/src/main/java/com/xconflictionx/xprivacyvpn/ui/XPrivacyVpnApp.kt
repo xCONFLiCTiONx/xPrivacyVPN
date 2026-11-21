@@ -1016,15 +1016,15 @@ private fun WireGuardAndDnsScreen(
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     FilterChip(
-                        selected = activeTransport == TunnelProtocol.WIREGUARD,
-                        onClick = { onSelectTransport(TunnelProtocol.WIREGUARD) },
-                        label = { Text("WireGuard") },
-                        modifier = Modifier.weight(1f)
-                    )
-                    FilterChip(
                         selected = activeTransport == TunnelProtocol.CLOUDFLARE_MASQUE,
                         onClick = { onSelectTransport(TunnelProtocol.CLOUDFLARE_MASQUE) },
                         label = { Text("Cloudflare MASQUE") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    FilterChip(
+                        selected = activeTransport == TunnelProtocol.WIREGUARD,
+                        onClick = { onSelectTransport(TunnelProtocol.WIREGUARD) },
+                        label = { Text("WireGuard") },
                         modifier = Modifier.weight(1f)
                     )
                 }

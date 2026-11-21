@@ -22,8 +22,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
                     (VpnStateManager.activeVpnService as? XPrivacyVpnService)?.syncTunnelIfConfigChanged()
                     return@runCatching
                 }
-                val hasWgConf = VpnStateManager.loadWireGuardConfText(appCtx).isNotBlank()
-                if (hasWgConf &&
+                if (VpnStateManager.hasConfiguredTunnel(appCtx) &&
                     VpnStateManager.isAutoStartOnBootEnabled(appCtx) &&
                     VpnService.prepare(appCtx) == null
                 ) {
