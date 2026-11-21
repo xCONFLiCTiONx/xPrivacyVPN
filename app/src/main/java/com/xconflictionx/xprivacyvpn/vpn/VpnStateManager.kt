@@ -2,6 +2,7 @@ package com.xconflictionx.xprivacyvpn.vpn
 
 import android.content.Context
 import android.net.VpnService
+import com.xconflictionx.xprivacyvpn.config.CloudflareOneConfig
 import com.xconflictionx.xprivacyvpn.config.WireGuardConfig
 import com.xconflictionx.xprivacyvpn.dns.ZeroTrustDnsConfig
 import com.xconflictionx.xprivacyvpn.dns.ZeroTrustDnsResolver
@@ -11,6 +12,8 @@ import com.xconflictionx.xprivacyvpn.filter.FilterSourceRepository
 import com.xconflictionx.xprivacyvpn.filter.FilterStats
 import com.xconflictionx.xprivacyvpn.firewall.FirewallManager
 import com.xconflictionx.xprivacyvpn.firewall.InstalledAppInfo
+import com.xconflictionx.xprivacyvpn.vpn.transport.AetherNative
+import com.xconflictionx.xprivacyvpn.vpn.transport.TunnelProtocol
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -39,6 +42,8 @@ data class TrafficLogEntry(
 data class VpnRuntimeState(
     val status: TunnelStatus = TunnelStatus.DISCONNECTED,
     val statusMessage: String = "Disconnected",
+    val activeTransport: TunnelProtocol = TunnelProtocol.WIREGUARD,
+    val cloudflareOneConfig: CloudflareOneConfig = CloudflareOneConfig(),
     val handshakeEstablished: Boolean = false,
     val lastHandshakeMs: Long = 0L,
     val endpoint: String = "Not Configured",
@@ -79,6 +84,22 @@ object VpnStateManager {
     private const val KEY_ZT_DOH = "zt_dns_doh"
     private const val KEY_PRIVATE_DNS_DOMAIN = "private_dns_domain"
     private const val KEY_PRIVATE_DNS_SERVER = "private_dns_server"
+
+    private const val KEY_ACTIVE_TRANSPORT = "active_transport_protocol"
+    private const val KEY_CF_TEAM = "cf_one_team_name"
+    private const val KEY_CF_EMAIL = "cf_one_user_email"
+    private const val KEY_CF_TOKEN = "cf_one_access_token"
+    private const val KEY_CF_SERVICE_ID = "cf_one_service_client_id"
+    private const val KEY_CF_SERVICE_SECRET = "cf_one_service_client_secret"
+    private const val KEY_CF_CUSTOM_PEER = "cf_one_custom_peer"
+    private const val KEY_CF_PREFER_H2 = "cf_one_prefer_h2"
+    private const val KEY_CF_ENABLE_ECH = "cf_one_enable_ech"
+    private const val KEY_CF_DEVICE_ID = "cf_one_device_id"
+    private const val KEY_CF_ORG = "cf_one_organization"
+    private const val KEY_CF_IPV4 = "cf_one_ipv4"
+    private const val KEY_CF_IPV6 = "cf_one_ipv6"
+    private const val KEY_CF_ASSIGNED_ENDPOINT = "cf_one_assigned_endpoint"
+    private const val KEY_CF_CERT_ISSUED_AT = "cf_one_cert_issued_at"
 
     private const val MAX_LOG_ENTRIES = 120
     private const val TELEMETRY_FLUSH_INTERVAL_MS = 1500L
@@ -187,16 +208,31 @@ object VpnStateManager {
         val ztDns = loadZeroTrustDnsConfig(dpCtx)
         val confText = loadWireGuardConfText(dpCtx)
         val parsed = WireGuardConfig.parse(confText).getOrNull()
+        val transport = loadActiveTransport(dpCtx)
+        val cfConfig = loadCloudflareOneConfig(dpCtx)
         val bypassed = loadBypassedPackages(dpCtx)
         val effectiveBypassed = FirewallManager.expandBypassPackages(bypassed)
 
         filterEngine.loadSources(sources)
         initialized = true
 
+        val displayEndpoint = if (transport == TunnelProtocol.CLOUDFLARE_MASQUE) {
+            cfConfig.displayEndpoint
+        } else {
+            parsed?.endpoint ?: "Not Configured"
+        }
+        val displayAddresses = if (transport == TunnelProtocol.CLOUDFLARE_MASQUE) {
+            cfConfig.displayAddresses
+        } else {
+            parsed?.addresses?.joinToString(", ") ?: "Import a .conf file in Tunnel tab"
+        }
+
         _state.update { current ->
             current.copy(
-                endpoint = parsed?.endpoint ?: "Not Configured",
-                tunnelAddresses = parsed?.addresses?.joinToString(", ") ?: "Import a .conf file in WG Conf tab",
+                activeTransport = transport,
+                cloudflareOneConfig = cfConfig,
+                endpoint = displayEndpoint,
+                tunnelAddresses = displayAddresses,
                 tunnelDns = ztDns.activeModeSummary(),
                 zeroTrustDns = ztDns,
                 dnsFilteringEnabled = dnsFilter,
@@ -208,6 +244,109 @@ object VpnStateManager {
                 filterStats = filterEngine.stats
             )
         }
+    }
+
+    fun aetherIdentityDir(context: Context): java.io.File {
+        return java.io.File(deviceProtectedContext(context).filesDir, "aether")
+    }
+
+    fun loadActiveTransport(context: Context): TunnelProtocol {
+        val prefs = deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val raw = prefs.getString(KEY_ACTIVE_TRANSPORT, TunnelProtocol.WIREGUARD.name)
+        return runCatching { TunnelProtocol.valueOf(raw ?: TunnelProtocol.WIREGUARD.name) }
+            .getOrDefault(TunnelProtocol.WIREGUARD)
+    }
+
+    fun saveActiveTransport(context: Context, protocol: TunnelProtocol) {
+        val dpCtx = deviceProtectedContext(context)
+        dpCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_ACTIVE_TRANSPORT, protocol.name)
+            .apply()
+        val parsedWg = WireGuardConfig.parse(loadWireGuardConfText(dpCtx)).getOrNull()
+        val cfConfig = loadCloudflareOneConfig(dpCtx)
+        _state.update { current ->
+            current.copy(
+                activeTransport = protocol,
+                endpoint = if (protocol == TunnelProtocol.CLOUDFLARE_MASQUE) {
+                    cfConfig.displayEndpoint
+                } else {
+                    parsedWg?.endpoint ?: "Not Configured"
+                },
+                tunnelAddresses = if (protocol == TunnelProtocol.CLOUDFLARE_MASQUE) {
+                    cfConfig.displayAddresses
+                } else {
+                    parsedWg?.addresses?.joinToString(", ") ?: "Import a .conf file in Tunnel tab"
+                }
+            )
+        }
+    }
+
+    fun loadCloudflareOneConfig(context: Context): CloudflareOneConfig {
+        val prefs = deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return CloudflareOneConfig(
+            teamName = prefs.getString(KEY_CF_TEAM, "") ?: "",
+            userEmail = prefs.getString(KEY_CF_EMAIL, "") ?: "",
+            accessToken = prefs.getString(KEY_CF_TOKEN, "") ?: "",
+            serviceClientId = prefs.getString(KEY_CF_SERVICE_ID, "") ?: "",
+            serviceClientSecret = prefs.getString(KEY_CF_SERVICE_SECRET, "") ?: "",
+            customPeerEndpoint = prefs.getString(KEY_CF_CUSTOM_PEER, "") ?: "",
+            preferHttp2 = prefs.getBoolean(KEY_CF_PREFER_H2, false),
+            enableEch = prefs.getBoolean(KEY_CF_ENABLE_ECH, false),
+            deviceId = prefs.getString(KEY_CF_DEVICE_ID, "") ?: "",
+            organization = prefs.getString(KEY_CF_ORG, "") ?: "",
+            ipv4Address = prefs.getString(KEY_CF_IPV4, "") ?: "",
+            ipv6Address = prefs.getString(KEY_CF_IPV6, "") ?: "",
+            assignedEndpoint = prefs.getString(KEY_CF_ASSIGNED_ENDPOINT, "") ?: "",
+            certIssuedAt = prefs.getLong(KEY_CF_CERT_ISSUED_AT, 0L)
+        )
+    }
+
+    fun saveCloudflareOneConfig(context: Context, config: CloudflareOneConfig) {
+        deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CF_TEAM, config.teamName.trim())
+            .putString(KEY_CF_EMAIL, config.userEmail.trim())
+            .putString(KEY_CF_TOKEN, config.accessToken.trim())
+            .putString(KEY_CF_SERVICE_ID, config.serviceClientId.trim())
+            .putString(KEY_CF_SERVICE_SECRET, config.serviceClientSecret.trim())
+            .putString(KEY_CF_CUSTOM_PEER, config.customPeerEndpoint.trim())
+            .putBoolean(KEY_CF_PREFER_H2, config.preferHttp2)
+            .putBoolean(KEY_CF_ENABLE_ECH, config.enableEch)
+            .putString(KEY_CF_DEVICE_ID, config.deviceId.trim())
+            .putString(KEY_CF_ORG, config.organization.trim())
+            .putString(KEY_CF_IPV4, config.ipv4Address.trim())
+            .putString(KEY_CF_IPV6, config.ipv6Address.trim())
+            .putString(KEY_CF_ASSIGNED_ENDPOINT, config.assignedEndpoint.trim())
+            .putLong(KEY_CF_CERT_ISSUED_AT, config.certIssuedAt)
+            .apply()
+
+        _state.update { current ->
+            val isMasque = current.activeTransport == TunnelProtocol.CLOUDFLARE_MASQUE
+            current.copy(
+                cloudflareOneConfig = config,
+                endpoint = if (isMasque) config.displayEndpoint else current.endpoint,
+                tunnelAddresses = if (isMasque) config.displayAddresses else current.tunnelAddresses
+            )
+        }
+    }
+
+    fun clearCloudflareOneCredentials(context: Context) {
+        val current = loadCloudflareOneConfig(context)
+        val cleared = current.copy(
+            accessToken = "",
+            serviceClientId = "",
+            serviceClientSecret = "",
+            deviceId = "",
+            organization = "",
+            ipv4Address = "",
+            ipv6Address = "",
+            assignedEndpoint = "",
+            certIssuedAt = 0L
+        )
+        saveCloudflareOneConfig(context, cleared)
+        runCatching { aetherIdentityDir(context).deleteRecursively() }
+        runCatching { AetherNative.nativeTeamTokenClear() }
     }
 
     fun loadBypassedPackages(context: Context): Set<String> {

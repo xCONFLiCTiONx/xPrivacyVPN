@@ -21,11 +21,14 @@ import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import com.xconflictionx.xprivacyvpn.MainActivity
 import com.xconflictionx.xprivacyvpn.R
+import com.xconflictionx.xprivacyvpn.config.CloudflareOneConfig
 import com.xconflictionx.xprivacyvpn.config.WireGuardConfig
 import com.xconflictionx.xprivacyvpn.dns.ZeroTrustDnsConfig
 import com.xconflictionx.xprivacyvpn.dns.ZeroTrustDnsResolver
 import com.xconflictionx.xprivacyvpn.packet.PacketAction
 import com.xconflictionx.xprivacyvpn.packet.PacketInspector
+import com.xconflictionx.xprivacyvpn.vpn.transport.AetherMasqueTransport
+import com.xconflictionx.xprivacyvpn.vpn.transport.TunnelProtocol
 import com.xconflictionx.xprivacyvpn.wireguard.WireGuardCrypto
 import com.xconflictionx.xprivacyvpn.wireguard.WireGuardSession
 import kotlinx.coroutines.CancellationException
@@ -73,10 +76,17 @@ class XPrivacyVpnService : VpnService() {
 
     private var tunnelJob: Job? = null
     private var udpRxJob: Job? = null
+    private var aetherRxJob: Job? = null
     private var firewallReloadJob: Job? = null
     private var keepaliveWatchdogJob: Job? = null
     private var screenStateReceiver: BroadcastReceiver? = null
     private var tunInterface: ParcelFileDescriptor? = null
+
+    @Volatile
+    private var activeAetherTransport: AetherMasqueTransport? = null
+
+    @Volatile
+    private var appliedTransport: TunnelProtocol? = null
 
     @Volatile
     private var appliedBypassPackages: Set<String> = emptySet()
@@ -194,18 +204,22 @@ class XPrivacyVpnService : VpnService() {
 
         val expectedAllowed = computeAllowedTunnelPackages()
         val currentZtDns = VpnStateManager.state.value.zeroTrustDns
+        val expectedTransport = VpnStateManager.state.value.activeTransport
         val expectedTunDns = computeTunDnsServers(currentZtDns, activeConfig)
         if (tunnelJob?.isActive == true &&
             tunInterface != null &&
+            appliedTransport == expectedTransport &&
             appliedBypassPackages == expectedAllowed &&
             appliedTunDnsServers == expectedTunDns
         ) {
-            val session = activeWgSession
-            val sock = udpSocket
-            val peer = activePeerAddress
-            if (session != null && sock != null && peer != null && !session.isEstablished) {
-                serviceScope.launch(Dispatchers.IO) {
-                    triggerHandshakeIfAllowed(session, sock, peer, force = true)
+            if (expectedTransport == TunnelProtocol.WIREGUARD) {
+                val session = activeWgSession
+                val sock = udpSocket
+                val peer = activePeerAddress
+                if (session != null && sock != null && peer != null && !session.isEstablished) {
+                    serviceScope.launch(Dispatchers.IO) {
+                        triggerHandshakeIfAllowed(session, sock, peer, force = true)
+                    }
                 }
             }
         } else {
@@ -265,6 +279,16 @@ class XPrivacyVpnService : VpnService() {
         serviceScope.launch {
             VpnStateManager.ensureInitialized(applicationContext)
             ZeroTrustDnsResolver.closePersistentConnections()
+
+            // Aether MASQUE path: trigger QUIC connection migration or reconnect
+            val aether = activeAetherTransport
+            if (aether != null) {
+                if (!aether.isAlive() || !aether.migrateNetwork()) {
+                    startVpnTunnel()
+                }
+                return@launch
+            }
+
             val session = activeWgSession ?: return@launch
             val cfg = activeConfig ?: return@launch
 
@@ -498,7 +522,16 @@ class XPrivacyVpnService : VpnService() {
 
     private fun startVpnTunnel() {
         tunnelJob?.cancel()
+        aetherRxJob?.cancel()
+        aetherRxJob = null
         registerPhysicalNetworkCallback()
+
+        val selectedTransport = VpnStateManager.state.value.activeTransport
+        appliedTransport = selectedTransport
+        if (selectedTransport == TunnelProtocol.CLOUDFLARE_MASQUE) {
+            startAetherMasqueTunnel()
+            return
+        }
 
         tunnelJob = serviceScope.launch {
             try {
@@ -760,6 +793,335 @@ class XPrivacyVpnService : VpnService() {
         }
     }
 
+    private fun parseIpAndPrefix(raw: String, defaultPrefix: Int): Pair<String, Int>? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return null
+        val slash = trimmed.indexOf('/')
+        return if (slash > 0) {
+            val ip = trimmed.substring(0, slash).trim()
+            val prefix = trimmed.substring(slash + 1).trim().toIntOrNull() ?: defaultPrefix
+            if (ip.isNotEmpty()) ip to prefix else null
+        } else {
+            trimmed to defaultPrefix
+        }
+    }
+
+    /**
+     * Runs the Cloudflare One MASQUE transport via Aether's native raw-IP CONNECT-IP engine.
+     * Preserves PacketInspector, ad blocking, Zero Trust DNS, per-app firewall, traffic counters,
+     * network migration, and fail-closed behavior (TUN stays held during reconnects so traffic
+     * never leaks to the physical network).
+     */
+    private fun startAetherMasqueTunnel() {
+        tunnelJob = serviceScope.launch {
+            try {
+                // Clean up any previous WireGuard or Aether transport cleanly first
+                runCatching { udpSocket?.close() }
+                udpSocket = null
+                activeWgSession = null
+                activeAetherTransport?.let { prev ->
+                    activeAetherTransport = null
+                    runCatching { prev.disconnect() }
+                }
+
+                VpnStateManager.ensureInitialized(applicationContext)
+                val cfConfig = VpnStateManager.loadCloudflareOneConfig(applicationContext)
+                if (!cfConfig.canConnect) {
+                    VpnStateManager.updateStatus(
+                        status = TunnelStatus.ERROR,
+                        message = "Cloudflare One not signed in. Sign in on the Tunnel tab.",
+                        handshakeEstablished = false
+                    )
+                    return@launch
+                }
+
+                VpnStateManager.updateStatus(
+                    status = TunnelStatus.CONNECTING,
+                    message = "Connecting Cloudflare One (MASQUE)...",
+                    handshakeEstablished = false
+                )
+                updateNotification("Connecting Cloudflare MASQUE...")
+
+                val transport = AetherMasqueTransport(
+                    vpnService = this@XPrivacyVpnService,
+                    identityDir = VpnStateManager.aetherIdentityDir(applicationContext),
+                    config = cfConfig,
+                    onStatusUpdate = { msg ->
+                        VpnStateManager.updateStatus(
+                            status = TunnelStatus.CONNECTING,
+                            message = msg,
+                            handshakeEstablished = false
+                        )
+                    }
+                )
+                activeAetherTransport = transport
+
+                transport.connect().getOrThrow()
+                val session = transport.sessionInfo
+                    ?: throw IllegalStateException("MASQUE session established without metadata")
+
+                // Persist updated Cloudflare identity / assigned addresses for reboot recovery
+                val updatedCf = cfConfig.copy(
+                    deviceId = session.identity.deviceId.ifBlank { cfConfig.deviceId },
+                    organization = session.identity.organization.ifBlank { cfConfig.organization },
+                    ipv4Address = session.ipv4.ifBlank { cfConfig.ipv4Address },
+                    ipv6Address = session.ipv6.ifBlank { cfConfig.ipv6Address },
+                    assignedEndpoint = session.peer.ifBlank { cfConfig.assignedEndpoint },
+                    certIssuedAt = if (session.identity.certIssuedAt > 0L) session.identity.certIssuedAt else cfConfig.certIssuedAt
+                )
+                VpnStateManager.saveCloudflareOneConfig(applicationContext, updatedCf)
+
+                // Build or rebuild Android TUN interface
+                runCatching { tunInterface?.close() }
+                tunInterface = null
+
+                val ztDns = VpnStateManager.state.value.zeroTrustDns
+                val builder = Builder()
+                    .setSession("xPrivacyVPN Cloudflare MASQUE")
+                    .setMtu(session.mtu)
+
+                val v4Pair = parseIpAndPrefix(session.ipv4, 32) ?: ("172.16.0.2" to 32)
+                builder.addAddress(v4Pair.first, v4Pair.second)
+                builder.addRoute("0.0.0.0", 0)
+
+                val v6Pair = parseIpAndPrefix(session.ipv6, 128)
+                if (v6Pair != null) {
+                    runCatching {
+                        builder.addAddress(v6Pair.first, v6Pair.second)
+                        builder.addRoute("::", 0)
+                    }
+                }
+
+                val tunDnsList = computeTunDnsServers(ztDns, null)
+                for (dns in tunDnsList) {
+                    runCatching { builder.addDnsServer(dns) }
+                }
+                if (ztDns.privateDomain.isNotBlank()) {
+                    runCatching {
+                        builder.addSearchDomain(ztDns.privateDomain.trim().trim('.'))
+                    }
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    builder.setMetered(false)
+                }
+
+                val allowedPackages = computeAllowedTunnelPackages()
+                for (pkg in allowedPackages) {
+                    runCatching { builder.addAllowedApplication(pkg) }
+                }
+                appliedBypassPackages = allowedPackages
+                appliedTunDnsServers = tunDnsList
+
+                val establishedTun = builder.establish()
+                    ?: throw IllegalStateException("VpnService.Builder.establish() returned null")
+                tunInterface = establishedTun
+                currentPhysicalNetwork?.let { runCatching { setUnderlyingNetworks(arrayOf(it)) } }
+
+                val tunIn = FileInputStream(establishedTun.fileDescriptor)
+                val tunOut = FileOutputStream(establishedTun.fileDescriptor)
+                tunOutStream = tunOut
+
+                val nowMs = System.currentTimeMillis()
+                lastRxEpochMs.set(nowMs)
+                lastTxEpochMs.set(nowMs)
+
+                val carrierLabel = if (session.carrier == "h2") "MASQUE H2" else "MASQUE H3"
+                VpnStateManager.updateStatus(
+                    status = TunnelStatus.CONNECTED,
+                    message = "Connected • $carrierLabel (${session.peer}) • ${ztDns.activeModeSummary()}",
+                    handshakeEstablished = true,
+                    lastHandshakeMs = nowMs
+                )
+                updateNotification("$carrierLabel + Filters Active (${VpnStateManager.state.value.filterStats.totalRules} rules)")
+
+                val tunnelDied = AtomicBoolean(false)
+
+                // Downlink loop: Cloudflare MASQUE raw IP packets -> Android TUN
+                aetherRxJob?.cancel()
+                aetherRxJob = serviceScope.launch(Dispatchers.IO) {
+                    val rxBuf = ByteArray(65535)
+                    while (isActive && !tunnelDied.get()) {
+                        val n = transport.receivePacketInto(rxBuf, timeoutMs = 250)
+                        if (n > 0) {
+                            lastRxEpochMs.set(System.currentTimeMillis())
+                            VpnStateManager.addRxBytes(n)
+                            synchronized(tunWriteLock) {
+                                runCatching { tunOut.write(rxBuf, 0, n) }
+                            }
+                        } else if (n < 0) {
+                            tunnelDied.set(true)
+                            break
+                        }
+                    }
+                }
+
+                // Uplink loop: Android TUN -> PacketInspector -> ZeroTrustDNS / AdBlock -> MASQUE raw IP
+                val tunBuf = ByteArray(65535)
+                while (isActive && !tunnelDied.get()) {
+                    val readLen = try {
+                        tunIn.read(tunBuf)
+                    } catch (_: Exception) {
+                        -1
+                    }
+                    if (readLen <= 0) {
+                        if (readLen < 0) {
+                            if (isActive && tunInterface != null) {
+                                delay(500L)
+                                throw IllegalStateException("TUN descriptor closed or EOF encountered")
+                            }
+                            break
+                        }
+                        continue
+                    }
+
+                    if (tunnelDied.get() || !transport.isAlive()) {
+                        // Fail-closed: drop packet and trigger reconnect without releasing TUN
+                        throw IllegalStateException("MASQUE tunnel disconnected")
+                    }
+
+                    val currentState = VpnStateManager.state.value
+                    val activeDnsCfg = currentState.zeroTrustDns
+                    val forwarderIps = buildSet {
+                        if (activeDnsCfg.privateDnsServer.isNotBlank()) add(activeDnsCfg.privateDnsServer.trim())
+                        addAll(activeDnsCfg.configuredIpv4List())
+                        addAll(activeDnsCfg.configuredIpv6List())
+                        add("1.1.1.1")
+                        add("1.0.0.1")
+                    }
+                    val action = PacketInspector.inspectOutboundPacket(
+                        packet = tunBuf,
+                        length = readLen,
+                        filterEngine = VpnStateManager.filterEngine,
+                        dnsFilteringEnabled = currentState.dnsFilteringEnabled,
+                        deepInspectionEnabled = currentState.deepInspectionEnabled,
+                        useNxDomain = currentState.useNxDomain,
+                        bypassedPackages = emptySet(),
+                        dnsForwarderIps = forwarderIps,
+                        dnsForwarderSourcePorts = ZeroTrustDnsResolver.activeUpstreamSourcePorts()
+                    )
+
+                    when (action) {
+                        is PacketAction.DropAndReply -> {
+                            if (action.replyPacket.isNotEmpty()) {
+                                synchronized(tunWriteLock) {
+                                    runCatching { tunOut.write(action.replyPacket) }
+                                }
+                            }
+                            if (action.logEvent) {
+                                VpnStateManager.recordTrafficEvent(
+                                    target = action.targetHost,
+                                    protocol = action.protocol,
+                                    blocked = true,
+                                    matchedRule = action.decision.matchedRule,
+                                    sourceName = action.decision.sourceName
+                                )
+                            }
+                        }
+                        is PacketAction.ForwardLogged -> {
+                            VpnStateManager.recordTrafficEvent(
+                                target = action.targetHost,
+                                protocol = action.protocol,
+                                blocked = false,
+                                matchedRule = action.decision.matchedRule,
+                                sourceName = action.decision.sourceName
+                            )
+                            val dnsPayload = action.dnsQueryPayload
+                            if (dnsPayload != null) {
+                                val cachedDnsResp = ZeroTrustDnsResolver.getCachedDnsResponse(dnsPayload)
+                                if (cachedDnsResp != null) {
+                                    val ipUdpReply = PacketInspector.buildDnsReplyFromUpstream(
+                                        originalPacket = tunBuf,
+                                        length = readLen,
+                                        dnsResponsePayload = cachedDnsResp
+                                    )
+                                    if (ipUdpReply != null) {
+                                        synchronized(tunWriteLock) {
+                                            runCatching { tunOut.write(ipUdpReply) }
+                                        }
+                                        VpnStateManager.addRxBytes(ipUdpReply.size)
+                                    }
+                                } else {
+                                    val reqCopy = tunBuf.copyOf(readLen)
+                                    launch(Dispatchers.IO) {
+                                        dnsConcurrencyLimiter.withPermit {
+                                            val dnsResp = ZeroTrustDnsResolver.resolveRawDnsQuery(
+                                                context = applicationContext,
+                                                dnsQueryPayload = dnsPayload,
+                                                config = activeDnsCfg,
+                                                vpnService = this@XPrivacyVpnService,
+                                                wireGuardDnsServers = emptyList()
+                                            )
+                                            if (dnsResp != null) {
+                                                val ipUdpReply = PacketInspector.buildDnsReplyFromUpstream(
+                                                    originalPacket = reqCopy,
+                                                    length = reqCopy.size,
+                                                    dnsResponsePayload = dnsResp
+                                                )
+                                                if (ipUdpReply != null) {
+                                                    synchronized(tunWriteLock) {
+                                                        runCatching { tunOut.write(ipUdpReply) }
+                                                    }
+                                                    VpnStateManager.addRxBytes(ipUdpReply.size)
+                                                }
+                                            } else {
+                                                val rc = transport.sendPacketFast(reqCopy, reqCopy.size)
+                                                if (rc == 0) {
+                                                    lastTxEpochMs.set(System.currentTimeMillis())
+                                                    VpnStateManager.addTxBytes(reqCopy.size)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                val rc = transport.sendPacketFast(tunBuf, readLen)
+                                if (rc == 0) {
+                                    lastTxEpochMs.set(System.currentTimeMillis())
+                                    VpnStateManager.addTxBytes(readLen)
+                                } else if (rc == -1) {
+                                    throw IllegalStateException("MASQUE tunnel closed during send")
+                                }
+                            }
+                        }
+                        PacketAction.ForwardToWireGuard -> {
+                            val rc = transport.sendPacketFast(tunBuf, readLen)
+                            if (rc == 0) {
+                                lastTxEpochMs.set(System.currentTimeMillis())
+                                VpnStateManager.addTxBytes(readLen)
+                            } else if (rc == -1) {
+                                throw IllegalStateException("MASQUE tunnel closed during send")
+                            }
+                        }
+                    }
+                }
+
+                aetherRxJob?.cancel()
+                if (tunnelDied.get() && isActive) {
+                    throw IllegalStateException("MASQUE downlink ended")
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                aetherRxJob?.cancel()
+                activeAetherTransport?.let { dead ->
+                    activeAetherTransport = null
+                    runCatching { dead.disconnect() }
+                }
+                VpnStateManager.updateStatus(
+                    status = TunnelStatus.CONNECTING,
+                    message = "MASQUE Reconnecting: ${e.message ?: "Recovering..."}",
+                    handshakeEstablished = false
+                )
+                delay(3000L)
+                if (isActive && VpnStateManager.state.value.activeTransport == TunnelProtocol.CLOUDFLARE_MASQUE) {
+                    startVpnTunnel()
+                } else if (!isActive) {
+                    stopVpnTunnel(resetStatus = false)
+                }
+            }
+        }
+    }
+
     private fun triggerHandshakeIfAllowed(
         wgSession: WireGuardSession,
         socket: DatagramSocket,
@@ -870,8 +1232,19 @@ class XPrivacyVpnService : VpnService() {
         keepaliveWatchdogJob = null
         udpRxJob?.cancel()
         udpRxJob = null
+        aetherRxJob?.cancel()
+        aetherRxJob = null
         tunnelJob?.cancel()
         tunnelJob = null
+        val aether = activeAetherTransport
+        activeAetherTransport = null
+        if (aether != null) {
+            // Stop Aether raw tunnel, free identity, and unregister VpnService.protect() callback
+            kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+                runCatching { aether.disconnect() }
+            }
+        }
+        appliedTransport = null
         activeWgSession = null
         activePeerAddress = null
         activeConfig = null

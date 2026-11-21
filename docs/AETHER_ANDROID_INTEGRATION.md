@@ -90,4 +90,13 @@ The feature branch now contains an upstream-source patch at patches/aether/0001-
 
 The JNI bridge registers a global reference to the active VpnService, attaches Aether worker threads to the JVM when necessary, invokes VpnService.protect(fd), and returns failure to Rust if protection fails or throws. Kotlin exposes registerSocketProtector(service) and unregisterSocketProtector(). Registration must occur before any Aether scan, verification, or tunnel operation; unregister only after Aether jobs and sockets have stopped.
 
-This bridge is implemented but not yet device-validated. Aether's current tunnel API exposes a SOCKS listener rather than a raw TUN packet channel. The existing xPrivacyVPN WireGuard service has not been switched to Aether, and the TUN-to-SOCKS adapter remains separate work. Do not register/unregister while native jobs are still opening sockets.
+## Direct Raw-IP MASQUE Tunnel FFI (Zero-SOCKS Architecture)
+
+Inspecting `third_party/Aether/aether/src/quic.rs` and `modes/masque.rs` confirmed that Aether's MASQUE core (`quic::run` for HTTP/3 QUIC and `masque_h2::run` for HTTP/2 fallback) already operates directly on raw IPv4/IPv6 packets through `quic::Channels` (`outbound_tx` / `inbound_rx` / `ctrl_tx`). Aether only attaches `smoltcp` + SOCKS5 on top for desktop CLI proxy users.
+
+Instead of building a double-encapsulated `TUN -> userspace TCP/IP -> SOCKS5 -> smoltcp -> IP -> MASQUE` translator, xPrivacyVPN tracks a second minimal upstream patch:
+
+- `patches/aether/0001-android-vpnservice-socket-protection.patch`: Fail-closed Android `VpnService.protect(fd)` callback in `egress::apply()` plus `aether_set_android_socket_protector`.
+- `patches/aether/0002-android-raw-ip-tunnel-ffi.patch`: Direct raw-IP MASQUE CONNECT-IP C ABI (`aether_raw_tunnel_start`, `aether_raw_tunnel_send`, `aether_raw_tunnel_recv`, `aether_raw_tunnel_is_alive`, `aether_raw_tunnel_migrate`, `aether_raw_tunnel_stop`).
+
+This gives Android native kernel handling for IPv4, IPv6, TCP, UDP, ICMP, QUIC, MTU, and fragmentation while keeping `PacketInspector`, ad blocking, Zero Trust DNS, per-app firewall, traffic counters, network migration, and fail-closed reconnect behavior identical to WireGuard. WireGuard remains selectable alongside Cloudflare One MASQUE in the Tunnel tab.

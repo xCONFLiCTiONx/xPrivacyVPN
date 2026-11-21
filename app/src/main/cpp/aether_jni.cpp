@@ -1,7 +1,9 @@
 #include <jni.h>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <mutex>
+#include <vector>
 
 #include "aether_ffi.h"
 
@@ -197,4 +199,79 @@ Java_com_xconflictionx_xprivacyvpn_vpn_transport_AetherNative_nativeRegisterSock
     g_protect_method = protect;
     aether_set_android_socket_protector(protect_android_socket);
     return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_xconflictionx_xprivacyvpn_vpn_transport_AetherNative_nativeRawTunnelStart(
+        JNIEnv *env, jobject, jlong identity, jstring payload) {
+    return call_id_string(env, identity, payload, aether_raw_tunnel_start);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_xconflictionx_xprivacyvpn_vpn_transport_AetherNative_nativeRawTunnelSend(
+        JNIEnv *env, jobject, jlong tunnel, jbyteArray packet, jint length) {
+    if (packet == nullptr || length <= 0 || length > 65535) return -1;
+    const jsize arr_len = env->GetArrayLength(packet);
+    if (length > arr_len) return -1;
+    uint8_t stack_buf[2048];
+    std::vector<uint8_t> heap_buf;
+    uint8_t *ptr = stack_buf;
+    if (length > static_cast<jint>(sizeof(stack_buf))) {
+        heap_buf.resize(static_cast<size_t>(length));
+        ptr = heap_buf.data();
+    }
+    env->GetByteArrayRegion(packet, 0, length, reinterpret_cast<jbyte *>(ptr));
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return -1;
+    }
+    return static_cast<jint>(aether_raw_tunnel_send(
+            static_cast<uint64_t>(tunnel), ptr, static_cast<size_t>(length)));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_xconflictionx_xprivacyvpn_vpn_transport_AetherNative_nativeRawTunnelRecv(
+        JNIEnv *env, jobject, jlong tunnel, jbyteArray out_buf, jint timeout_ms) {
+    if (out_buf == nullptr) return -1;
+    const jsize cap = env->GetArrayLength(out_buf);
+    if (cap <= 0) return -1;
+    uint8_t stack_buf[2048];
+    std::vector<uint8_t> heap_buf;
+    uint8_t *ptr = stack_buf;
+    const size_t read_cap = static_cast<size_t>(cap > 65535 ? 65535 : cap);
+    if (read_cap > sizeof(stack_buf)) {
+        heap_buf.resize(read_cap);
+        ptr = heap_buf.data();
+    }
+    const int32_t n = aether_raw_tunnel_recv(
+            static_cast<uint64_t>(tunnel),
+            ptr,
+            read_cap,
+            static_cast<uint32_t>(timeout_ms > 0 ? timeout_ms : 100));
+    if (n > 0) {
+        env->SetByteArrayRegion(out_buf, 0, static_cast<jsize>(n), reinterpret_cast<const jbyte *>(ptr));
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            return -1;
+        }
+    }
+    return static_cast<jint>(n);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_xconflictionx_xprivacyvpn_vpn_transport_AetherNative_nativeRawTunnelIsAlive(
+        JNIEnv *, jobject, jlong tunnel) {
+    return aether_raw_tunnel_is_alive(static_cast<uint64_t>(tunnel)) == 1 ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_xconflictionx_xprivacyvpn_vpn_transport_AetherNative_nativeRawTunnelMigrate(
+        JNIEnv *, jobject, jlong tunnel) {
+    return aether_raw_tunnel_migrate(static_cast<uint64_t>(tunnel)) == 1 ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_xconflictionx_xprivacyvpn_vpn_transport_AetherNative_nativeRawTunnelStop(
+        JNIEnv *env, jobject, jlong tunnel) {
+    return call_id(env, tunnel, aether_raw_tunnel_stop);
 }

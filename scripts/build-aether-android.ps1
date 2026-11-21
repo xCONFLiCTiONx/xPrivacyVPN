@@ -43,23 +43,27 @@ if (-not (Test-Path $Manifest)) {
     throw "Aether Cargo manifest not found: $Manifest"
 }
 
-$AetherPatch = Join-Path $RepoRoot "patches/aether/0001-android-vpnservice-socket-protection.patch"
-if (-not (Test-Path $AetherPatch)) {
-    throw "Required Android socket-protection patch is missing: $AetherPatch"
+$PatchDir = Join-Path $RepoRoot "patches/aether"
+$AetherPatches = @(Get-ChildItem -Path $PatchDir -Filter "*.patch" | Sort-Object Name)
+if ($AetherPatches.Count -eq 0) {
+    throw "Required Android patches are missing in: $PatchDir"
 }
 Push-Location $AetherPath
 try {
-    git apply --reverse --check $AetherPatch 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "Aether Android socket-protection patch is already applied."
-    } else {
-        git apply --check $AetherPatch
-        if ($LASTEXITCODE -ne 0) {
-            throw "The Android socket-protection patch does not apply cleanly to the pinned Aether revision."
-        }
-        git apply $AetherPatch
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to apply the Android socket-protection patch."
+    foreach ($Patch in $AetherPatches) {
+        git apply --reverse --check $Patch.FullName 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Aether patch already applied: $($Patch.Name)"
+        } else {
+            git apply --check $Patch.FullName
+            if ($LASTEXITCODE -ne 0) {
+                throw "Aether patch does not apply cleanly to the pinned Aether revision: $($Patch.Name)"
+            }
+            git apply $Patch.FullName
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to apply Aether patch: $($Patch.Name)"
+            }
+            Write-Host "Applied Aether patch: $($Patch.Name)"
         }
     }
 } finally {
@@ -92,6 +96,24 @@ if (-not $env:ANDROID_NDK_HOME -and -not $env:ANDROID_NDK_ROOT -and -not $env:ND
     throw "Set ANDROID_NDK_HOME (or ANDROID_NDK_ROOT / NDK_HOME / ANDROID_HOME) to an installed Android NDK."
 }
 
+# Normalize NDK compiler and toolchain paths with forward slashes and .exe on Windows
+# so boring-sys's CMake invocation does not fail on unescaped backslashes.
+$ResolvedNdk = $env:ANDROID_NDK_HOME
+if (-not $ResolvedNdk) { $ResolvedNdk = $env:ANDROID_NDK_ROOT }
+if (-not $ResolvedNdk) { $ResolvedNdk = $env:NDK_HOME }
+if ($ResolvedNdk -and (Test-Path $ResolvedNdk)) {
+    $NdkForward = $ResolvedNdk.Replace('\', '/')
+    $NdkToolchainBin = "$NdkForward/toolchains/llvm/prebuilt/windows-x86_64/bin"
+    $ToolchainFile = "$NdkForward/build/cmake/android.toolchain.cmake"
+    if (Test-Path "$NdkToolchainBin/clang.exe") {
+        foreach ($RustTarget in $TargetMap.Values) {
+            [System.Environment]::SetEnvironmentVariable("CC_$RustTarget", "$NdkToolchainBin/clang.exe", "Process")
+            [System.Environment]::SetEnvironmentVariable("CXX_$RustTarget", "$NdkToolchainBin/clang++.exe", "Process")
+        }
+        $env:ANDROID_NDK_HOME = $NdkForward
+    }
+}
+
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 $CargoNdkArgs = @()
@@ -99,11 +121,10 @@ foreach ($Abi in $Targets) {
     $CargoNdkArgs += @("-t", $Abi)
 }
 $CargoNdkArgs += @(
-    "-p", "$ApiLevel",
+    "--platform", "$ApiLevel",
     "-o", $OutputDir,
     "build",
     "--lib",
-    "--manifest-path", $Manifest,
     "--release"
 )
 
@@ -111,9 +132,14 @@ Write-Host "Building Aether for Android: $($Targets -join ', ')" -ForegroundColo
 Write-Host "Pinned source: $((git -C $AetherPath rev-parse HEAD).Trim())"
 Write-Host "Output: $OutputDir"
 
-& cargo ndk @CargoNdkArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "Aether Android build failed."
+Push-Location (Join-Path $AetherPath "aether")
+try {
+    & cargo ndk @CargoNdkArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Aether Android build failed."
+    }
+} finally {
+    Pop-Location
 }
 
 foreach ($Abi in $Targets) {

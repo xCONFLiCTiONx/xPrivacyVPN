@@ -11,6 +11,7 @@ import android.os.PowerManager
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.xconflictionx.xprivacyvpn.config.CloudflareOneConfig
 import com.xconflictionx.xprivacyvpn.config.WireGuardConfig
 import com.xconflictionx.xprivacyvpn.dns.ZeroTrustDnsConfig
 import com.xconflictionx.xprivacyvpn.filter.FilterDecision
@@ -25,6 +26,9 @@ import com.xconflictionx.xprivacyvpn.security.XSecuritySyncResult
 import com.xconflictionx.xprivacyvpn.vpn.TunnelStatus
 import com.xconflictionx.xprivacyvpn.vpn.VpnRuntimeState
 import com.xconflictionx.xprivacyvpn.vpn.VpnStateManager
+import com.xconflictionx.xprivacyvpn.vpn.transport.AetherNative
+import com.xconflictionx.xprivacyvpn.vpn.transport.TunnelProtocol
+import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -53,6 +57,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _ztDnsDraft = MutableStateFlow(ZeroTrustDnsConfig())
     val ztDnsDraft: StateFlow<ZeroTrustDnsConfig> = _ztDnsDraft.asStateFlow()
+
+    private val _cfOneDraft = MutableStateFlow(CloudflareOneConfig())
+    val cfOneDraft: StateFlow<CloudflareOneConfig> = _cfOneDraft.asStateFlow()
+
+    private val _cfOtpSessionId = MutableStateFlow(0L)
+    val cfOtpSessionId: StateFlow<Long> = _cfOtpSessionId.asStateFlow()
+
+    private val _cfAuthBusy = MutableStateFlow(false)
+    val cfAuthBusy: StateFlow<Boolean> = _cfAuthBusy.asStateFlow()
 
     private val _statusBanner = MutableStateFlow<String?>(null)
     val statusBanner: StateFlow<String?> = _statusBanner.asStateFlow()
@@ -96,6 +109,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         VpnStateManager.initialize(application.applicationContext, initialSources)
         _wgConfText.value = VpnStateManager.loadWireGuardConfText(application.applicationContext)
         _ztDnsDraft.value = VpnStateManager.loadZeroTrustDnsConfig(application.applicationContext)
+        _cfOneDraft.value = VpnStateManager.loadCloudflareOneConfig(application.applicationContext)
         refreshPermissionStatus()
         refreshInstalledApps()
         refreshDeviceSecurityReport()
@@ -213,6 +227,174 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun hasValidWgConfig(): Boolean {
         return WireGuardConfig.parse(_wgConfText.value).isSuccess
+    }
+
+    fun hasValidActiveTransportConfig(): Boolean {
+        return when (vpnState.value.activeTransport) {
+            TunnelProtocol.WIREGUARD -> hasValidWgConfig()
+            TunnelProtocol.CLOUDFLARE_MASQUE -> vpnState.value.cloudflareOneConfig.canConnect
+        }
+    }
+
+    fun selectTransport(protocol: TunnelProtocol) {
+        val ctx = getApplication<Application>().applicationContext
+        VpnStateManager.saveActiveTransport(ctx, protocol)
+        val label = if (protocol == TunnelProtocol.CLOUDFLARE_MASQUE) "Cloudflare One (MASQUE)" else "WireGuard"
+        _statusBanner.value = "Active VPN transport switched to $label"
+        val currentStatus = vpnState.value.status
+        if (currentStatus == TunnelStatus.CONNECTED || currentStatus == TunnelStatus.CONNECTING) {
+            (VpnStateManager.activeVpnService as? com.xconflictionx.xprivacyvpn.vpn.XPrivacyVpnService)?.onFirewallBypassChanged()
+        }
+    }
+
+    fun updateCfOneDraft(updated: CloudflareOneConfig) {
+        _cfOneDraft.value = updated
+    }
+
+    fun saveCfOneSettings() {
+        val ctx = getApplication<Application>().applicationContext
+        val draft = _cfOneDraft.value
+        val existing = VpnStateManager.loadCloudflareOneConfig(ctx)
+        val merged = draft.copy(
+            deviceId = existing.deviceId,
+            organization = existing.organization,
+            ipv4Address = existing.ipv4Address,
+            ipv6Address = existing.ipv6Address,
+            assignedEndpoint = existing.assignedEndpoint,
+            certIssuedAt = existing.certIssuedAt
+        )
+        VpnStateManager.saveCloudflareOneConfig(ctx, merged)
+        _cfOneDraft.value = merged
+        if (merged.hasValidToken) {
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { AetherNative.nativeTeamTokenSet(merged.accessToken.trim()) }
+            }
+        }
+        _statusBanner.value = "Saved Cloudflare One MASQUE settings"
+    }
+
+    fun requestCloudflareOtpCode() {
+        val draft = _cfOneDraft.value
+        val team = CloudflareOneConfig.normalizeTeamName(draft.teamName)
+        val email = draft.userEmail.trim()
+        if (team.isEmpty()) {
+            _statusBanner.value = "Enter a valid Cloudflare Zero Trust team name (e.g. my-org)."
+            return
+        }
+        if (email.isEmpty() || !email.contains('@')) {
+            _statusBanner.value = "Enter a valid email address to receive your one-time code."
+            return
+        }
+        viewModelScope.launch {
+            _cfAuthBusy.value = true
+            try {
+                val prevSession = _cfOtpSessionId.value
+                if (prevSession > 0L) {
+                    withContext(Dispatchers.IO) { runCatching { AetherNative.nativeTeamSessionFree(prevSession) } }
+                    _cfOtpSessionId.value = 0L
+                }
+                val payload = JSONObject().apply {
+                    put("team", team)
+                    put("email", email)
+                }
+                val res = withContext(Dispatchers.IO) {
+                    AetherNative.awaitJob(AetherNative.nativeTeamCodeRequest(payload.toString()), timeoutMs = 45_000L)
+                }
+                val session = res.optLong("session", 0L)
+                check(session > 0L) { "Cloudflare did not return a verification session" }
+                _cfOtpSessionId.value = session
+                saveCfOneSettings()
+                _statusBanner.value = "Verification code sent to $email. Enter the 6-digit code below."
+            } catch (e: Exception) {
+                _statusBanner.value = "Code request failed: ${e.message ?: "Unknown error"}"
+            } finally {
+                _cfAuthBusy.value = false
+            }
+        }
+    }
+
+    fun resendCloudflareOtpCode() {
+        val session = _cfOtpSessionId.value
+        if (session <= 0L) {
+            requestCloudflareOtpCode()
+            return
+        }
+        viewModelScope.launch {
+            _cfAuthBusy.value = true
+            try {
+                withContext(Dispatchers.IO) {
+                    AetherNative.awaitJob(AetherNative.nativeTeamCodeResend(session), timeoutMs = 45_000L)
+                }
+                _statusBanner.value = "Verification code resent to ${_cfOneDraft.value.userEmail.trim()}"
+            } catch (e: Exception) {
+                _statusBanner.value = "Resend failed: ${e.message ?: "Unknown error"}"
+            } finally {
+                _cfAuthBusy.value = false
+            }
+        }
+    }
+
+    fun submitCloudflareOtpCode(code: String) {
+        val session = _cfOtpSessionId.value
+        val cleaned = code.trim()
+        if (session <= 0L) {
+            _statusBanner.value = "Request a verification code first."
+            return
+        }
+        if (cleaned.isEmpty()) {
+            _statusBanner.value = "Enter the verification code from your email."
+            return
+        }
+        viewModelScope.launch {
+            _cfAuthBusy.value = true
+            try {
+                val res = withContext(Dispatchers.IO) {
+                    AetherNative.awaitJob(AetherNative.nativeTeamCodeSubmit(session, cleaned), timeoutMs = 45_000L)
+                }
+                val signedIn = res.optBoolean("signed_in", false)
+                val token = res.optString("token", "").trim()
+                if (signedIn && token.isNotEmpty()) {
+                    withContext(Dispatchers.IO) { runCatching { AetherNative.nativeTeamSessionFree(session) } }
+                    _cfOtpSessionId.value = 0L
+                    val ctx = getApplication<Application>().applicationContext
+                    val updated = _cfOneDraft.value.copy(accessToken = token)
+                    _cfOneDraft.value = updated
+                    VpnStateManager.saveCloudflareOneConfig(ctx, updated)
+                    _statusBanner.value = "Cloudflare Zero Trust sign-in verified! Tap Connect on Home to enroll & start MASQUE."
+                } else {
+                    _statusBanner.value = "Verification code was rejected. Check the code or tap Resend."
+                }
+            } catch (e: Exception) {
+                _statusBanner.value = "Verification failed: ${e.message ?: "Unknown error"}"
+            } finally {
+                _cfAuthBusy.value = false
+            }
+        }
+    }
+
+    fun logoutCloudflareOne() {
+        viewModelScope.launch {
+            val session = _cfOtpSessionId.value
+            if (session > 0L) {
+                withContext(Dispatchers.IO) { runCatching { AetherNative.nativeTeamSessionFree(session) } }
+                _cfOtpSessionId.value = 0L
+            }
+            val ctx = getApplication<Application>().applicationContext
+            withContext(Dispatchers.IO) {
+                VpnStateManager.clearCloudflareOneCredentials(ctx)
+            }
+            _cfOneDraft.value = VpnStateManager.loadCloudflareOneConfig(ctx)
+            _statusBanner.value = "Cleared Cloudflare One credentials and device identity."
+        }
+    }
+
+    override fun onCleared() {
+        val session = _cfOtpSessionId.value
+        if (session > 0L) {
+            runCatching { AetherNative.nativeTeamSessionFree(session) }
+            _cfOtpSessionId.value = 0L
+        }
+        super.onCleared()
     }
 
     fun updateZtDnsDraft(updated: ZeroTrustDnsConfig) {

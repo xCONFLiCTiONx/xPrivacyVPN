@@ -13,6 +13,7 @@ import java.util.concurrent.TimeoutException
  */
 object AetherNative {
     init {
+        System.loadLibrary("c++_shared")
         System.loadLibrary("aether")
         System.loadLibrary("xprivacy_aether_jni")
     }
@@ -35,6 +36,12 @@ object AetherNative {
     external fun nativeTeamSessionFree(session: Long): String
     external fun nativeTeamTokenSet(token: String): String
     external fun nativeTeamTokenClear(): String
+    external fun nativeRawTunnelStart(identity: Long, payloadJson: String): String
+    external fun nativeRawTunnelSend(tunnel: Long, packet: ByteArray, length: Int): Int
+    external fun nativeRawTunnelRecv(tunnel: Long, outBuf: ByteArray, timeoutMs: Int): Int
+    external fun nativeRawTunnelIsAlive(tunnel: Long): Boolean
+    external fun nativeRawTunnelMigrate(tunnel: Long): Boolean
+    external fun nativeRawTunnelStop(tunnel: Long): String
 
     /**
      * Register Android's VPN socket-protection callback before starting Aether jobs.

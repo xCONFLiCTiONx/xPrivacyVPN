@@ -97,6 +97,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
+import com.xconflictionx.xprivacyvpn.config.CloudflareOneConfig
 import com.xconflictionx.xprivacyvpn.config.WireGuardConfig
 import com.xconflictionx.xprivacyvpn.dns.ZeroTrustDnsConfig
 import com.xconflictionx.xprivacyvpn.filter.FilterDecision
@@ -108,6 +109,7 @@ import com.xconflictionx.xprivacyvpn.security.XSecuritySyncResult
 import com.xconflictionx.xprivacyvpn.vpn.TrafficLogEntry
 import com.xconflictionx.xprivacyvpn.vpn.TunnelStatus
 import com.xconflictionx.xprivacyvpn.vpn.VpnRuntimeState
+import com.xconflictionx.xprivacyvpn.vpn.transport.TunnelProtocol
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -146,6 +148,9 @@ fun XPrivacyVpnApp(
     val filterSources by viewModel.filterSources.collectAsState()
     val wgConfText by viewModel.wgConfText.collectAsState()
     val ztDnsDraft by viewModel.ztDnsDraft.collectAsState()
+    val cfOneDraft by viewModel.cfOneDraft.collectAsState()
+    val cfOtpSessionId by viewModel.cfOtpSessionId.collectAsState()
+    val cfAuthBusy by viewModel.cfAuthBusy.collectAsState()
     val banner by viewModel.statusBanner.collectAsState()
     val isSyncing by viewModel.isSyncingFilters.collectAsState()
     val permissionStatus by viewModel.permissionStatus.collectAsState()
@@ -249,8 +254,13 @@ fun XPrivacyVpnApp(
                         onToggleConnect = {
                             val isActive = vpnState.status == TunnelStatus.CONNECTED ||
                                 vpnState.status == TunnelStatus.CONNECTING
-                            if (!isActive && !viewModel.hasValidWgConfig()) {
-                                viewModel.showBanner("Please import or paste your WireGuard .conf file first.")
+                            if (!isActive && !viewModel.hasValidActiveTransportConfig()) {
+                                val msg = if (vpnState.activeTransport == TunnelProtocol.CLOUDFLARE_MASQUE) {
+                                    "Please sign in to Cloudflare One on the Tunnel tab first."
+                                } else {
+                                    "Please import or paste your WireGuard .conf file first."
+                                }
+                                viewModel.showBanner(msg)
                                 selectedTab = 3
                             } else {
                                 onToggleVpn(!isActive)
@@ -281,6 +291,18 @@ fun XPrivacyVpnApp(
                         onClearAllBypassed = { viewModel.clearAllBypassedApps() }
                     )
                     3 -> WireGuardAndDnsScreen(
+                        activeTransport = vpnState.activeTransport,
+                        cfOneDraft = cfOneDraft,
+                        activeCfOne = vpnState.cloudflareOneConfig,
+                        cfOtpSessionId = cfOtpSessionId,
+                        cfAuthBusy = cfAuthBusy,
+                        onSelectTransport = { viewModel.selectTransport(it) },
+                        onCfOneDraftChange = { viewModel.updateCfOneDraft(it) },
+                        onSaveCfOneSettings = { viewModel.saveCfOneSettings() },
+                        onRequestCfOtp = { viewModel.requestCloudflareOtpCode() },
+                        onResendCfOtp = { viewModel.resendCloudflareOtpCode() },
+                        onSubmitCfOtp = { viewModel.submitCloudflareOtpCode(it) },
+                        onLogoutCfOne = { viewModel.logoutCloudflareOne() },
                         confText = wgConfText,
                         ztDnsDraft = ztDnsDraft,
                         activeZtDns = vpnState.zeroTrustDns,
@@ -631,11 +653,16 @@ private fun FirewallScreen(
     onClearAllBypassed: () -> Unit
 ) {
     var searchQuery by remember { mutableStateOf("") }
-    // 0 = All User Apps, 1 = Tunneled, 2 = Bypassed
+    // 0 = All Visible Apps, 1 = Tunneled, 2 = Bypassed
     var filterMode by remember { mutableIntStateOf(0) }
+    var showSystemApps by remember { mutableStateOf(false) }
 
-    val userApps = remember(installedApps) {
-        installedApps.filter { FirewallManager.isUserApp(it) }
+    val userApps = remember(installedApps, showSystemApps) {
+        if (showSystemApps) {
+            installedApps
+        } else {
+            installedApps.filter { FirewallManager.isUserApp(it) || it.hasLauncherIcon }
+        }
     }
 
     val tunneledAppsCount = remember(userApps, state.effectiveBypassedPackages) {
@@ -745,6 +772,11 @@ private fun FirewallScreen(
                         selected = filterMode == 2,
                         onClick = { filterMode = 2 },
                         label = { Text("Bypassed ($bypassedAppsCount)") }
+                    )
+                    FilterChip(
+                        selected = showSystemApps,
+                        onClick = { showSystemApps = !showSystemApps },
+                        label = { Text("System") }
                     )
                 }
             }
@@ -922,6 +954,18 @@ private fun AppFirewallItemCard(
 
 @Composable
 private fun WireGuardAndDnsScreen(
+    activeTransport: TunnelProtocol,
+    cfOneDraft: CloudflareOneConfig,
+    activeCfOne: CloudflareOneConfig,
+    cfOtpSessionId: Long,
+    cfAuthBusy: Boolean,
+    onSelectTransport: (TunnelProtocol) -> Unit,
+    onCfOneDraftChange: (CloudflareOneConfig) -> Unit,
+    onSaveCfOneSettings: () -> Unit,
+    onRequestCfOtp: () -> Unit,
+    onResendCfOtp: () -> Unit,
+    onSubmitCfOtp: (String) -> Unit,
+    onLogoutCfOne: () -> Unit,
     confText: String,
     ztDnsDraft: ZeroTrustDnsConfig,
     activeZtDns: ZeroTrustDnsConfig,
@@ -938,6 +982,7 @@ private fun WireGuardAndDnsScreen(
 ) {
     val parsedResult = remember(confText) { WireGuardConfig.parse(confText) }
     val parsed = parsedResult.getOrNull()
+    var otpCodeDraft by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
@@ -946,6 +991,234 @@ private fun WireGuardAndDnsScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        // Section 0: VPN Transport Selector (WireGuard vs Cloudflare One MASQUE)
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = RoundedCornerShape(14.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.SettingsEthernet, contentDescription = null, tint = Color(0xFF00E5A3), modifier = Modifier.size(22.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("VPN Transport Protocol", fontWeight = FontWeight.Bold, fontSize = 17.sp, color = Color.White)
+                }
+                Text(
+                    "Choose between your existing WireGuard tunnel or Cloudflare One MASQUE (HTTP/3 QUIC CONNECT-IP via Aether). Both preserve PacketInspector, ad blocking, Zero Trust DNS, and per-app firewall.",
+                    fontSize = 12.sp,
+                    color = Color(0xFF94A3B8)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    FilterChip(
+                        selected = activeTransport == TunnelProtocol.WIREGUARD,
+                        onClick = { onSelectTransport(TunnelProtocol.WIREGUARD) },
+                        label = { Text("WireGuard") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    FilterChip(
+                        selected = activeTransport == TunnelProtocol.CLOUDFLARE_MASQUE,
+                        onClick = { onSelectTransport(TunnelProtocol.CLOUDFLARE_MASQUE) },
+                        label = { Text("Cloudflare MASQUE") },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
+        // Section 0b: Cloudflare One Zero Trust Authentication & MASQUE Config
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = RoundedCornerShape(14.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.VpnKey, contentDescription = null, tint = Color(0xFF38BDF8), modifier = Modifier.size(22.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Cloudflare One (MASQUE)", fontWeight = FontWeight.Bold, fontSize = 17.sp, color = Color.White)
+                    Spacer(modifier = Modifier.weight(1f))
+                    StatusBadge(
+                        ok = activeCfOne.canConnect,
+                        okText = if (activeCfOne.isEnrolled) "ENROLLED" else "SIGNED IN",
+                        warnText = "SIGN IN"
+                    )
+                }
+
+                if (activeCfOne.isEnrolled) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFF0A2E22))
+                            .padding(12.dp)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text(
+                                text = "Device Enrolled • Org: ${activeCfOne.organization.ifBlank { activeCfOne.normalizedTeam }}",
+                                color = Color(0xFF00E5A3),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                            Text(
+                                text = "ID: ${activeCfOne.deviceId.take(18)} • ${activeCfOne.displayAddresses}",
+                                fontSize = 11.sp,
+                                color = Color(0xFFE2E8F0)
+                            )
+                            Text(
+                                text = "Edge: ${activeCfOne.displayEndpoint}",
+                                fontSize = 11.sp,
+                                color = Color(0xFF94A3B8)
+                            )
+                        }
+                    }
+                } else if (activeCfOne.hasValidToken) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFF0A2E22))
+                            .padding(12.dp)
+                    ) {
+                        Text(
+                            text = "Cloudflare Access token active for team '${activeCfOne.normalizedTeam}'. Connect on Home to complete MASQUE enrollment.",
+                            color = Color(0xFF00E5A3),
+                            fontSize = 12.sp
+                        )
+                    }
+                } else if (activeCfOne.accessToken.isNotBlank()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFF3B1219))
+                            .padding(12.dp)
+                    ) {
+                        Text(
+                            text = "Access token expired. Request a new email verification code below to refresh.",
+                            color = Color(0xFFF87171),
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+
+                OutlinedTextField(
+                    value = cfOneDraft.teamName,
+                    onValueChange = { onCfOneDraftChange(cfOneDraft.copy(teamName = it)) },
+                    label = { Text("Zero Trust Team Name") },
+                    placeholder = { Text("my-team (or my-team.cloudflareaccess.com)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = cfOneDraft.userEmail,
+                    onValueChange = { onCfOneDraftChange(cfOneDraft.copy(userEmail = it)) },
+                    label = { Text("User Email (One-Time Code)") },
+                    placeholder = { Text("you@example.com") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = onRequestCfOtp,
+                        enabled = !cfAuthBusy,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (cfAuthBusy) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(modifier = Modifier.width(6.dp))
+                        }
+                        Text(if (cfOtpSessionId > 0L) "New Code" else "Send Login Code")
+                    }
+                    if (cfOtpSessionId > 0L) {
+                        OutlinedButton(
+                            onClick = onResendCfOtp,
+                            enabled = !cfAuthBusy
+                        ) {
+                            Text("Resend")
+                        }
+                    }
+                }
+
+                if (cfOtpSessionId > 0L) {
+                    OutlinedTextField(
+                        value = otpCodeDraft,
+                        onValueChange = { otpCodeDraft = it },
+                        label = { Text("One-Time Verification Code") },
+                        placeholder = { Text("Enter 6-digit code from email") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Button(
+                        onClick = {
+                            onSubmitCfOtp(otpCodeDraft)
+                            otpCodeDraft = ""
+                        },
+                        enabled = !cfAuthBusy && otpCodeDraft.isNotBlank(),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Verify & Sign In")
+                    }
+                }
+
+                OutlinedTextField(
+                    value = cfOneDraft.customPeerEndpoint,
+                    onValueChange = { onCfOneDraftChange(cfOneDraft.copy(customPeerEndpoint = it)) },
+                    label = { Text("Custom MASQUE Edge (Optional)") },
+                    placeholder = { Text("Auto-discover if blank (e.g. 162.159.198.1:443)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                SettingToggleRow(
+                    title = "HTTP/2 TCP Fallback",
+                    subtitle = "Use MASQUE over HTTP/2 TCP instead of HTTP/3 QUIC UDP",
+                    checked = cfOneDraft.preferHttp2,
+                    onCheckedChange = { onCfOneDraftChange(cfOneDraft.copy(preferHttp2 = it)) }
+                )
+
+                SettingToggleRow(
+                    title = "Encrypted Client Hello (ECH)",
+                    subtitle = "Encrypt TLS SNI during MASQUE handshake",
+                    checked = cfOneDraft.enableEch,
+                    onCheckedChange = { onCfOneDraftChange(cfOneDraft.copy(enableEch = it)) }
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = onSaveCfOneSettings,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Save MASQUE Settings")
+                    }
+                    if (activeCfOne.canConnect || activeCfOne.accessToken.isNotBlank()) {
+                        OutlinedButton(onClick = onLogoutCfOne) {
+                            Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Logout")
+                        }
+                    }
+                }
+            }
+        }
+
         // Section 1: Private split DNS
         Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),

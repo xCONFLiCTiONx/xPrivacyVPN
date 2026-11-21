@@ -55,6 +55,7 @@ desktop.ini
 .kotlin/
 **/build/
 app/release/
+app/src/main/jniLibs/
 captures/
 .externalNativeBuild/
 .cxx/
