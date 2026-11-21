@@ -2,11 +2,18 @@ package com.xconflictionx.xprivacyvpn.vpn.transport
 
 import android.net.VpnService
 import com.xconflictionx.xprivacyvpn.config.CloudflareOneConfig
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 data class AetherIdentityInfo(
@@ -42,7 +49,8 @@ class AetherMasqueTransport(
     private val vpnService: VpnService,
     private val identityDir: File,
     private val config: CloudflareOneConfig,
-    private val onStatusUpdate: (String) -> Unit = {}
+    private val onStatusUpdate: (String) -> Unit = {},
+    private val onIdentityOpened: (AetherIdentityInfo) -> Unit = {}
 ) : TunnelTransport {
 
     override val protocol: TunnelProtocol = TunnelProtocol.CLOUDFLARE_MASQUE
@@ -121,6 +129,10 @@ class AetherMasqueTransport(
                 "Cloudflare device identity does not have a MASQUE certificate"
             }
 
+            // Persist enrolled identity metadata immediately so a transient peer scan or
+            // tunnel timeout never loses enrollment state or triggers a false "not signed in" error.
+            runCatching { onIdentityOpened(identityInfo) }
+
             // 4. Select and verify a reachable MASQUE edge endpoint
             val peer = resolveReachablePeer(idHandle, identityInfo)
 
@@ -164,49 +176,138 @@ class AetherMasqueTransport(
             return ensurePort(custom, 443)
         }
 
-        val assigned = identityInfo.assignedEndpoint.trim()
-        if (assigned.isNotEmpty()) {
-            val candidate = ensurePort(assigned, 443)
-            onStatusUpdate("Verifying Cloudflare edge $candidate...")
-            val verifyPayload = JSONObject().apply {
-                put("peer", candidate)
-                put("transport", "masque")
-                put("ech", config.enableEch)
-            }
-            val verified = runCatching {
-                val res = AetherNative.awaitJob(
-                    AetherNative.nativeVerifyStart(idHandle, verifyPayload.toString()),
-                    timeoutMs = 12_000L
-                )
-                res.optBoolean("reachable", false)
-            }.getOrDefault(false)
-            if (verified) return candidate
+        val candidates = buildFastGatewayCandidates(identityInfo)
+
+        // Aether's FFI verify/scan jobs only probe UDP/QUIC unless AETHER_MASQUE_H2 is set in env.
+        // When HTTP/2 TCP fallback is enabled, skip UDP probing and dial the prioritized anycast edge directly.
+        if (config.preferHttp2) {
+            return candidates.first()
         }
 
-        onStatusUpdate("Scanning for fastest Cloudflare MASQUE gateway...")
+        // Probe Cloudflare's prioritized anycast MASQUE gateways (Zero Trust 162.159.197.x first for teams,
+        // plus assigned/cached edge) in parallel with noise disabled so healthy networks pick the fastest
+        // gateway in ~150-400ms instead of running a slow 45s subnet scan.
+        onStatusUpdate("Finding fastest Cloudflare MASQUE gateway...")
+        val fastWinner = probeFastestCandidate(
+            idHandle = idHandle,
+            candidates = candidates.take(5),
+            timeoutMs = 6_000L
+        )
+        if (fastWinner != null) {
+            return fastWinner
+        }
+
+        // Fallback scan if port 443 anycast probes were blocked (e.g. restrictive firewall/ISP)
+        onStatusUpdate("Scanning alternate Cloudflare MASQUE ports...")
         val scanPayload = JSONObject().apply {
             put("transport", "masque")
             put("mode", "fast")
             put("ip", "v4")
+            put("profile", "off")
+            put("ports", JSONArray(listOf(443, 4500, 500, 1701)))
             put("ech", config.enableEch)
         }
-        val scanResult = AetherNative.awaitJob(
-            AetherNative.nativeScanStart(idHandle, scanPayload.toString()),
-            timeoutMs = 45_000L
-        )
-        val endpointObj = scanResult.optJSONObject("endpoint")
-        val scannedIp = endpointObj?.optString("ip", "")?.trim().orEmpty()
-        val scannedPort = endpointObj?.optInt("port", 443) ?: 443
-        if (scannedIp.isNotEmpty()) {
-            return if (scannedIp.contains(':') && !scannedIp.startsWith('[')) {
-                "[$scannedIp]:$scannedPort"
+        val scannedEndpoint = runCatching {
+            val scanResult = AetherNative.awaitJob(
+                AetherNative.nativeScanStart(idHandle, scanPayload.toString()),
+                timeoutMs = 15_000L
+            )
+            val endpointObj = scanResult.optJSONObject("endpoint")
+            val scannedIp = endpointObj?.optString("ip", "")?.trim().orEmpty()
+            val scannedPort = endpointObj?.optInt("port", 443) ?: 443
+            if (scannedIp.isNotEmpty()) {
+                if (scannedIp.contains(':') && !scannedIp.startsWith('[')) {
+                    "[$scannedIp]:$scannedPort"
+                } else {
+                    "$scannedIp:$scannedPort"
+                }
             } else {
-                "$scannedIp:$scannedPort"
+                val endpointStr = scanResult.optString("endpoint", "").trim()
+                if (endpointStr.isNotEmpty()) ensurePort(endpointStr, 443) else null
+            }
+        }.getOrNull()
+
+        if (!scannedEndpoint.isNullOrBlank()) {
+            return scannedEndpoint
+        }
+
+        // Last resort: dial the top prioritized anycast gateway directly so raw tunnel startup
+        // can either succeed or surface the exact QUIC/TLS error.
+        return candidates.first()
+    }
+
+    internal fun buildFastGatewayCandidates(identityInfo: AetherIdentityInfo): List<String> {
+        val isZeroTrust = config.normalizedTeam.isNotEmpty() || identityInfo.organization.isNotBlank()
+        val ordered = LinkedHashSet<String>()
+        identityInfo.assignedEndpoint.trim().takeIf { it.isNotEmpty() }?.let {
+            ordered.add(ensurePort(it, 443))
+        }
+        config.assignedEndpoint.trim().takeIf { it.isNotEmpty() }?.let {
+            ordered.add(ensurePort(it, 443))
+        }
+        val anycastSeeds = if (isZeroTrust) {
+            listOf(
+                "162.159.197.2:443",
+                "162.159.197.1:443",
+                "162.159.197.3:443",
+                "162.159.198.2:443",
+                "162.159.198.1:443",
+                "162.159.199.2:443"
+            )
+        } else {
+            listOf(
+                "162.159.198.2:443",
+                "162.159.198.1:443",
+                "162.159.199.2:443",
+                "162.159.199.1:443"
+            )
+        }
+        ordered.addAll(anycastSeeds)
+        return ordered.toList()
+    }
+
+    private suspend fun probeFastestCandidate(
+        idHandle: Long,
+        candidates: List<String>,
+        timeoutMs: Long
+    ): String? {
+        if (candidates.isEmpty()) return null
+        return withTimeoutOrNull(timeoutMs) {
+            coroutineScope {
+                val winner = CompletableDeferred<String?>()
+                val remaining = AtomicInteger(candidates.size)
+                val jobs = candidates.map { candidate ->
+                    launch(Dispatchers.IO) {
+                        val reachable = try {
+                            val verifyPayload = JSONObject().apply {
+                                put("peer", candidate)
+                                put("transport", "masque")
+                                put("profile", "off")
+                                put("ech", config.enableEch)
+                            }
+                            val res = AetherNative.awaitJob(
+                                AetherNative.nativeVerifyStart(idHandle, verifyPayload.toString()),
+                                timeoutMs = timeoutMs
+                            )
+                            res.optBoolean("reachable", false)
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (_: Exception) {
+                            false
+                        }
+
+                        if (reachable) {
+                            winner.complete(candidate)
+                        } else if (remaining.decrementAndGet() == 0) {
+                            winner.complete(null)
+                        }
+                    }
+                }
+                val result = winner.await()
+                jobs.forEach { it.cancel() }
+                result
             }
         }
-        val endpointStr = scanResult.optString("endpoint", "").trim()
-        check(endpointStr.isNotEmpty()) { "No reachable Cloudflare MASQUE gateway found" }
-        return ensurePort(endpointStr, 443)
     }
 
     private fun ensurePort(addr: String, defaultPort: Int): String {

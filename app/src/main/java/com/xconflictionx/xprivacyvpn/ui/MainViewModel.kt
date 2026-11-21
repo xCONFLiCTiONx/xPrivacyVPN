@@ -232,7 +232,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun hasValidActiveTransportConfig(): Boolean {
         return when (vpnState.value.activeTransport) {
             TunnelProtocol.WIREGUARD -> hasValidWgConfig()
-            TunnelProtocol.CLOUDFLARE_MASQUE -> vpnState.value.cloudflareOneConfig.canConnect
+            TunnelProtocol.CLOUDFLARE_MASQUE -> {
+                val cfg = vpnState.value.cloudflareOneConfig
+                cfg.canConnect || VpnStateManager.hasPersistedAetherIdentity(getApplication(), cfg)
+            }
         }
     }
 

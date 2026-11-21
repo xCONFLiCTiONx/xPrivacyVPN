@@ -250,6 +250,30 @@ object VpnStateManager {
         return java.io.File(deviceProtectedContext(context).filesDir, "aether")
     }
 
+    fun aetherIdentityFile(context: Context, config: CloudflareOneConfig): java.io.File {
+        val team = config.normalizedTeam
+        val fileName = if (team.isNotEmpty()) "aether-team-$team.toml" else "aether-masque.toml"
+        return java.io.File(aetherIdentityDir(context), fileName)
+    }
+
+    fun hasPersistedAetherIdentity(
+        context: Context,
+        config: CloudflareOneConfig = loadCloudflareOneConfig(context)
+    ): Boolean {
+        val file = aetherIdentityFile(context, config)
+        return file.exists() && file.length() > 0L
+    }
+
+    private fun parseTomlStringValue(text: String, key: String): String {
+        val regex = Regex("""(?m)^\s*${Regex.escape(key)}\s*=\s*"([^"]*)"\s*$""")
+        return regex.find(text)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+    }
+
+    private fun parseTomlLongValue(text: String, key: String): Long {
+        val regex = Regex("""(?m)^\s*${Regex.escape(key)}\s*=\s*(\d+)\s*$""")
+        return regex.find(text)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
+    }
+
     fun loadActiveTransport(context: Context): TunnelProtocol {
         val prefs = deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val raw = prefs.getString(KEY_ACTIVE_TRANSPORT, TunnelProtocol.WIREGUARD.name)
@@ -284,7 +308,7 @@ object VpnStateManager {
 
     fun loadCloudflareOneConfig(context: Context): CloudflareOneConfig {
         val prefs = deviceProtectedContext(context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return CloudflareOneConfig(
+        val base = CloudflareOneConfig(
             teamName = prefs.getString(KEY_CF_TEAM, "") ?: "",
             userEmail = prefs.getString(KEY_CF_EMAIL, "") ?: "",
             accessToken = prefs.getString(KEY_CF_TOKEN, "") ?: "",
@@ -300,6 +324,36 @@ object VpnStateManager {
             assignedEndpoint = prefs.getString(KEY_CF_ASSIGNED_ENDPOINT, "") ?: "",
             certIssuedAt = prefs.getLong(KEY_CF_CERT_ISSUED_AT, 0L)
         )
+        if (!base.isEnrolled) {
+            val identityFile = aetherIdentityFile(context, base)
+            if (identityFile.exists() && identityFile.length() > 0L) {
+                val hydrated = runCatching {
+                    val toml = identityFile.readText()
+                    val fileDeviceId = parseTomlStringValue(toml, "device_id")
+                    val fileIpv4 = parseTomlStringValue(toml, "ipv4")
+                    val fileIpv6 = parseTomlStringValue(toml, "ipv6")
+                    val fileOrg = parseTomlStringValue(toml, "organization")
+                    val fileEndpoint = parseTomlStringValue(toml, "assigned_endpoint")
+                    val fileCertIssuedAt = parseTomlLongValue(toml, "cert_issued_at")
+                    if (fileDeviceId.isNotBlank() && fileIpv4.isNotBlank()) {
+                        base.copy(
+                            deviceId = base.deviceId.ifBlank { fileDeviceId },
+                            organization = base.organization.ifBlank { fileOrg },
+                            ipv4Address = base.ipv4Address.ifBlank { fileIpv4 },
+                            ipv6Address = base.ipv6Address.ifBlank { fileIpv6 },
+                            assignedEndpoint = base.assignedEndpoint.ifBlank { fileEndpoint },
+                            certIssuedAt = if (base.certIssuedAt > 0L) base.certIssuedAt else fileCertIssuedAt
+                        )
+                    } else {
+                        base
+                    }
+                }.getOrDefault(base)
+                if (hydrated != base) {
+                    return hydrated
+                }
+            }
+        }
+        return base
     }
 
     fun saveCloudflareOneConfig(context: Context, config: CloudflareOneConfig) {

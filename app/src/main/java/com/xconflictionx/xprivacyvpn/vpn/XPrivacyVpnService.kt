@@ -825,8 +825,8 @@ class XPrivacyVpnService : VpnService() {
                 }
 
                 VpnStateManager.ensureInitialized(applicationContext)
-                val cfConfig = VpnStateManager.loadCloudflareOneConfig(applicationContext)
-                if (!cfConfig.canConnect) {
+                var cfConfig = VpnStateManager.loadCloudflareOneConfig(applicationContext)
+                if (!cfConfig.canConnect && !VpnStateManager.hasPersistedAetherIdentity(applicationContext, cfConfig)) {
                     VpnStateManager.updateStatus(
                         status = TunnelStatus.ERROR,
                         message = "Cloudflare One not signed in. Sign in on the Tunnel tab.",
@@ -852,6 +852,18 @@ class XPrivacyVpnService : VpnService() {
                             message = msg,
                             handshakeEstablished = false
                         )
+                    },
+                    onIdentityOpened = { identity ->
+                        val enrolledCf = cfConfig.copy(
+                            deviceId = identity.deviceId.ifBlank { cfConfig.deviceId },
+                            organization = identity.organization.ifBlank { cfConfig.organization },
+                            ipv4Address = identity.ipv4.ifBlank { cfConfig.ipv4Address },
+                            ipv6Address = identity.ipv6.ifBlank { cfConfig.ipv6Address },
+                            assignedEndpoint = identity.assignedEndpoint.ifBlank { cfConfig.assignedEndpoint },
+                            certIssuedAt = if (identity.certIssuedAt > 0L) identity.certIssuedAt else cfConfig.certIssuedAt
+                        )
+                        cfConfig = enrolledCf
+                        VpnStateManager.saveCloudflareOneConfig(applicationContext, enrolledCf)
                     }
                 )
                 activeAetherTransport = transport
