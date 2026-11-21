@@ -163,10 +163,10 @@ Connect an Android device with USB debugging enabled, then run:
 
 The script builds the optimized Release APK, installs it with `adb install -r`, and launches the app when a device is available. It does not uninstall the existing app or erase its data if the signing key differs.
 
-Build without installing:
+To build without a connected device, run the Gradle Release task directly:
 
 ```powershell
-.\.build.ps1 -SkipInstall
+.\gradlew.bat :app:assembleRelease
 ```
 
 ### 3. Run unit tests
